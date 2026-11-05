@@ -262,9 +262,11 @@ def OpenACC_KernelEnvironmentOp
     Variadic<AnyType>:$dataClauseOperands,
     Optional<IntOrIndex>:$asyncOperand,
     UnitAttr:$asyncOnly,
-    Optional<IntOrIndex>:$waitDevnum,
     Variadic<IntOrIndex>:$waitOperands,
-    UnitAttr:$waitOnly);
+    OptionalAttr<DenseI32ArrayAttr>:$waitOperandsSegments,
+    OptionalAttr<DeviceTypeArrayAttr>:$waitOperandsDeviceType,
+    OptionalAttr<BoolArrayAttr>:$hasWaitDevnum,
+    OptionalAttr<BoolArrayAttr>:$waitAllQueues);
 
   let regions = (region SizedRegion<1>:$region);
 
@@ -273,9 +275,9 @@ def OpenACC_KernelEnvironmentOp
         `dataOperands` `(` $dataClauseOperands `:` type($dataClauseOperands) `)`
       | `async` `` custom<OperandWithKeywordOnly>($asyncOperand,
             type($asyncOperand), $asyncOnly)
-      | `wait_devnum` `(` $waitDevnum `:` type($waitDevnum) `)`
-      | `wait` `` custom<OperandsWithKeywordOnly>($waitOperands,
-            type($waitOperands), $waitOnly)
+      | `wait` `` custom<WaitClause>($waitOperands, type($waitOperands),
+          $waitOperandsDeviceType, $waitOperandsSegments, $hasWaitDevnum,
+          $waitAllQueues)
     )
     $region attr-dict
   }];
@@ -293,6 +295,24 @@ def OpenACC_KernelEnvironmentOp
     static KernelEnvironmentOp createAndPopulate(
         ComputeConstructT computeConstruct, ::mlir::acc::DeviceType deviceType,
         ::mlir::OpBuilder &builder);
+
+    /// Return true if the op has the wait attribute for the
+    /// mlir::acc::DeviceType::None device_type.
+    bool hasWaitOnly();
+    bool hasWaitOnly(unsigned segmentIdx);
+    unsigned getNumWaitSegments();
+    /// Return the values of the wait clause if present.
+    mlir::Operation::operand_range getWaitValues();
+    mlir::Operation::operand_range getWaitValues(unsigned segmentIdx);
+    /// Return the wait devnum value clause if present;
+    mlir::Value getWaitDevnum();
+    mlir::Value getWaitDevnum(unsigned segmentIdx);
+    /// Add an entry to the 'wait-only' attribute (clause spelled without
+    /// arguments).
+    void addWaitOnly(MLIRContext *, llvm::ArrayRef<DeviceType>);
+    /// Add an array-like entry to the 'wait'.
+    void addWaitOperands(MLIRContext *, bool hasDevnum, mlir::ValueRange,
+                         llvm::ArrayRef<DeviceType>);
   }];
 }
 

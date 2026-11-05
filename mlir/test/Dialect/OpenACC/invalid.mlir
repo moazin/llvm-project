@@ -183,8 +183,8 @@ acc.update
 %cst = arith.constant 1 : index
 %value = memref.alloc() : memref<f32>
 %0 = acc.update_device varPtr(%value : memref<f32>) -> memref<f32>
-// expected-error@+1 {{wait attribute cannot appear with waitOperands}}
-"acc.update"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 0, 1, 1>, waitOperandsDeviceType = [#acc.device_type<none>], waitOperandsSegments = array<i32: 1>, hasWaitDevnum = [false], waitOnly = [#acc.device_type<none>]}> : (index, memref<f32>) -> ()
+// expected-error@+1 {{waitAllQueues count must match wait segment count}}
+"acc.update"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 0, 1, 1>, waitOperandsDeviceType = [#acc.device_type<none>], waitOperandsSegments = array<i32: 1>, hasWaitDevnum = [false], waitAllQueues = [true, false]}> : (index, memref<f32>) -> ()
 
 // -----
 
@@ -257,7 +257,7 @@ acc.exit_data async
 %value = memref.alloc() : memref<f32>
 %0 = acc.getdeviceptr varPtr(%value : memref<f32>) -> memref<f32>
 // expected-error@+1 {{async attribute cannot appear with asyncOperand}}
-"acc.exit_data"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 1, 0, 0, 1>, async}> : (index, memref<f32>) -> ()
+"acc.exit_data"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 1, 0, 1>, async}> : (index, memref<f32>) -> ()
 acc.delete accPtr(%0 : memref<f32>)
 
 // -----
@@ -265,8 +265,8 @@ acc.delete accPtr(%0 : memref<f32>)
 %cst = arith.constant 1 : index
 %value = memref.alloc() : memref<f32>
 %0 = acc.getdeviceptr varPtr(%value : memref<f32>) -> memref<f32>
-// expected-error@+1 {{wait_devnum cannot appear without waitOperands}}
-acc.exit_data wait_devnum(%cst: index) dataOperands(%0 : memref<f32>)
+// expected-error@+1 {{waitAllQueues count must match wait segment count}}
+"acc.exit_data"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 0, 1, 1>, waitOperandsDeviceType = [#acc.device_type<none>], waitOperandsSegments = array<i32: 1>, hasWaitDevnum = [false], waitAllQueues = [true, false]}> : (index, memref<f32>) -> ()
 acc.delete accPtr(%0 : memref<f32>)
 
 // -----
@@ -280,23 +280,23 @@ acc.enter_data async
 %value = memref.alloc() : memref<f32>
 %0 = acc.create varPtr(%value : memref<f32>) -> memref<f32>
 // expected-error@+1 {{async attribute cannot appear with asyncOperand}}
-"acc.enter_data"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 1, 0, 0, 1>, async}> : (index, memref<f32>) -> ()
+"acc.enter_data"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 1, 0, 1>, async}> : (index, memref<f32>) -> ()
 
 // -----
 
 %cst = arith.constant 1 : index
 %value = memref.alloc() : memref<f32>
 %0 = acc.create varPtr(%value : memref<f32>) -> memref<f32>
-// expected-error@+1 {{wait attribute cannot appear with waitOperands}}
-"acc.enter_data"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 0, 0, 1, 1>, wait}> : (index, memref<f32>) -> ()
+// expected-error@+1 {{waitAllQueues count must match wait segment count}}
+"acc.enter_data"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 0, 1, 1>, waitOperandsDeviceType = [#acc.device_type<none>], waitOperandsSegments = array<i32: 1>, hasWaitDevnum = [false], waitAllQueues = [true, false]}> : (index, memref<f32>) -> ()
 
 // -----
 
 %cst = arith.constant 1 : index
 %value = memref.alloc() : memref<f32>
 %0 = acc.create varPtr(%value : memref<f32>) -> memref<f32>
-// expected-error@+1 {{wait_devnum cannot appear without waitOperands}}
-acc.enter_data wait_devnum(%cst: index) dataOperands(%0 : memref<f32>)
+// expected-error@+1 {{hasWaitDevnum count must match wait segment count}}
+"acc.enter_data"(%cst, %0) <{operandSegmentSizes = array<i32: 0, 0, 1, 1>, waitOperandsDeviceType = [#acc.device_type<none>], waitOperandsSegments = array<i32: 1>, hasWaitDevnum = [true, false], waitAllQueues = [false]}> : (index, memref<f32>) -> ()
 
 // -----
 

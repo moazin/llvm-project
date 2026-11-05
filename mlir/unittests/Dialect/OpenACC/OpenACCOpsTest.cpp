@@ -310,27 +310,47 @@ static void testWaitOnly(OpBuilder &b, MLIRContext &context, Location loc,
   for (auto d : dtypes)
     EXPECT_FALSE(op->hasWaitOnly(d));
 
-  auto dtypeNone = DeviceTypeAttr::get(&context, DeviceType::None);
-  op->setWaitOnlyAttr(b.getArrayAttr({dtypeNone}));
+  auto setWaitAllQueues = [&](llvm::ArrayRef<DeviceType> deviceTypes) {
+    llvm::SmallVector<Attribute> deviceTypeAttrs;
+    llvm::SmallVector<int32_t> segments;
+    llvm::SmallVector<bool> hasDevnum;
+    llvm::SmallVector<bool> waitAllQueues;
+    for (DeviceType deviceType : deviceTypes) {
+      deviceTypeAttrs.push_back(DeviceTypeAttr::get(&context, deviceType));
+      segments.push_back(0);
+      hasDevnum.push_back(false);
+      waitAllQueues.push_back(true);
+    }
+    op->setWaitOperandsDeviceTypeAttr(b.getArrayAttr(deviceTypeAttrs));
+    op->setWaitOperandsSegments(b.getDenseI32ArrayAttr(segments));
+    op->setHasWaitDevnumAttr(b.getBoolArrayAttr(hasDevnum));
+    op->setWaitAllQueuesAttr(b.getBoolArrayAttr(waitAllQueues));
+  };
+  auto clearWaitAllQueues = [&]() {
+    op->removeWaitOperandsDeviceTypeAttr();
+    op->removeWaitOperandsSegmentsAttr();
+    op->removeHasWaitDevnumAttr();
+    op->removeWaitAllQueuesAttr();
+  };
+
+  setWaitAllQueues({DeviceType::None});
   EXPECT_TRUE(op->hasWaitOnly());
   EXPECT_TRUE(op->hasWaitOnly(DeviceType::None));
   for (auto d : dtypesWithoutNone)
     EXPECT_FALSE(op->hasWaitOnly(d));
-  op->removeWaitOnlyAttr();
+  clearWaitAllQueues();
 
-  auto dtypeHost = DeviceTypeAttr::get(&context, DeviceType::Host);
-  op->setWaitOnlyAttr(b.getArrayAttr({dtypeHost}));
+  setWaitAllQueues({DeviceType::Host});
   EXPECT_TRUE(op->hasWaitOnly(DeviceType::Host));
   EXPECT_FALSE(op->hasWaitOnly());
-  op->removeWaitOnlyAttr();
+  clearWaitAllQueues();
 
-  auto dtypeStar = DeviceTypeAttr::get(&context, DeviceType::Star);
-  op->setWaitOnlyAttr(b.getArrayAttr({dtypeHost, dtypeStar}));
+  setWaitAllQueues({DeviceType::Host, DeviceType::Star});
   EXPECT_TRUE(op->hasWaitOnly(DeviceType::Star));
   EXPECT_TRUE(op->hasWaitOnly(DeviceType::Host));
   EXPECT_FALSE(op->hasWaitOnly());
 
-  op->removeWaitOnlyAttr();
+  clearWaitAllQueues();
 }
 
 TEST_F(OpenACCOpsTest, waitOnlyTest) {

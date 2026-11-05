@@ -84,22 +84,22 @@ subroutine acc_exit_data
   !$acc exit data delete(a) wait(1)
 !CHECK: %[[DEVPTR:.*]] = acc.getdeviceptr varPtr(%[[DECLA]]#0 : !fir.ref<!fir.array<10x10xf32>>) dataClause(acc_delete) structured(false) name("a") -> !fir.ref<!fir.array<10x10xf32>>
 !CHECK: %[[WAIT1:.*]] = arith.constant 1 : i32
-!CHECK: acc.exit_data wait(%[[WAIT1]] : i32) dataOperands(%[[DEVPTR]] : !fir.ref<!fir.array<10x10xf32>>)
+!CHECK: acc.exit_data wait({%[[WAIT1]] : i32}) dataOperands(%[[DEVPTR]] : !fir.ref<!fir.array<10x10xf32>>)
 !CHECK: acc.delete accPtr(%[[DEVPTR]] : !fir.ref<!fir.array<10x10xf32>>) structured(false) name("a")
 
   !$acc exit data delete(a) wait(queues: 1, 2)
 !CHECK: %[[DEVPTR:.*]] = acc.getdeviceptr varPtr(%[[DECLA]]#0 : !fir.ref<!fir.array<10x10xf32>>) dataClause(acc_delete) structured(false) name("a") -> !fir.ref<!fir.array<10x10xf32>>
 !CHECK: %[[WAIT2:.*]] = arith.constant 1 : i32
 !CHECK: %[[WAIT3:.*]] = arith.constant 2 : i32
-!CHECK: acc.exit_data wait(%[[WAIT2]], %[[WAIT3]] : i32, i32) dataOperands(%[[DEVPTR]] : !fir.ref<!fir.array<10x10xf32>>)
+!CHECK: acc.exit_data wait({%[[WAIT2]] : i32, %[[WAIT3]] : i32}) dataOperands(%[[DEVPTR]] : !fir.ref<!fir.array<10x10xf32>>)
 !CHECK: acc.delete accPtr(%[[DEVPTR]] : !fir.ref<!fir.array<10x10xf32>>) structured(false) name("a")
 
   !$acc exit data delete(a) wait(devnum: 1: queues: 1, 2)
 !CHECK: %[[DEVPTR:.*]] = acc.getdeviceptr varPtr(%[[DECLA]]#0 : !fir.ref<!fir.array<10x10xf32>>) dataClause(acc_delete) structured(false) name("a") -> !fir.ref<!fir.array<10x10xf32>>
 !CHECK: %[[WAIT4:.*]] = arith.constant 1 : i32
-!CHECK: %[[WAIT5:.*]] = arith.constant 2 : i32
-!CHECK: %[[WAIT6:.*]] = arith.constant 1 : i32
-!CHECK: acc.exit_data wait_devnum(%[[WAIT6]] : i32) wait(%[[WAIT4]], %[[WAIT5]] : i32, i32) dataOperands(%[[DEVPTR]] : !fir.ref<!fir.array<10x10xf32>>)
+!CHECK: %[[WAIT5:.*]] = arith.constant 1 : i32
+!CHECK: %[[WAIT6:.*]] = arith.constant 2 : i32
+!CHECK: acc.exit_data wait({devnum: %[[WAIT4]] : i32, %[[WAIT5]] : i32, %[[WAIT6]] : i32}) dataOperands(%[[DEVPTR]] : !fir.ref<!fir.array<10x10xf32>>)
 !CHECK: acc.delete accPtr(%[[DEVPTR]] : !fir.ref<!fir.array<10x10xf32>>) structured(false) name("a")
 
   !$acc exit data delete(a) finalize

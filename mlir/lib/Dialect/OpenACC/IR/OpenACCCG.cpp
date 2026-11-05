@@ -32,7 +32,6 @@ using namespace mlir;
 using namespace acc;
 
 namespace {
-
 /// Generic helper for single-region OpenACC ops that execute their body once
 /// and then continue after the operation with their results (if any).
 static void
@@ -66,13 +65,17 @@ struct RemoveEmptyKernelEnvironment
       return failure();
 
     // Remove empty kernel environment.
-    // Preserve synchronization by creating acc.wait operation if needed.
-    if (!op.getWaitOperands().empty() || op.getWaitOnlyAttr())
-      rewriter.replaceOpWithNewOp<acc::WaitOp>(
-          op, op.getWaitOperands(), /*asyncOperand=*/Value(),
-          op.getWaitDevnum(), /*async=*/nullptr, /*ifCond=*/Value());
-    else
+    // Preserve synchronization by creating acc.wait operations if needed.
+    if (op.getNumWaitSegments() != 0) {
+      rewriter.setInsertionPoint(op);
+      for (unsigned i = 0, e = op.getNumWaitSegments(); i != e; ++i)
+        rewriter.create<acc::WaitOp>(
+            op.getLoc(), op.getWaitValues(i), /*asyncOperand=*/Value(),
+            op.getWaitDevnum(i), /*async=*/nullptr, /*ifCond=*/Value());
       rewriter.eraseOp(op);
+    } else {
+      rewriter.eraseOp(op);
+    }
 
     return success();
   }
@@ -296,7 +299,6 @@ static void printGPUParallelDimList(AsmPrinter &printer,
   });
   printer << "]";
 }
-
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -335,48 +337,72 @@ extractAsyncClause(ComputeConstructT computeConstruct,
   return false;
 }
 
-/// Extract wait for `clauseDeviceType`. Returns true if a clause was found.
-template <typename ComputeConstructT>
-static bool extractWaitClause(ComputeConstructT computeConstruct,
-                              DeviceType clauseDeviceType, MLIRContext *context,
-                              std::optional<Value> &waitDevnum,
-                              SmallVectorImpl<Value> &waitOperands,
-                              UnitAttr &waitOnly) {
-  if (computeConstruct.hasWaitOnly(clauseDeviceType)) {
-    waitOnly = UnitAttr::get(context);
-    return true;
-  }
-  Value devnum = computeConstruct.getWaitDevnum(clauseDeviceType);
-  auto waitValues = computeConstruct.getWaitValues(clauseDeviceType);
-  if (!devnum && waitValues.empty())
+static SmallVector<DeviceType, 3>
+getDeviceTypesByPrecedenceForKernelEnvironment(DeviceType deviceType) {
+  SmallVector<DeviceType, 3> deviceTypes;
+  if (deviceType != DeviceType::None && deviceType != DeviceType::Star)
+    deviceTypes.push_back(deviceType);
+  deviceTypes.push_back(DeviceType::Star);
+  deviceTypes.push_back(DeviceType::None);
+  return deviceTypes;
+}
+
+static std::optional<DeviceType> getDeviceType(ArrayAttr attrs,
+                                               unsigned index) {
+  if (index >= attrs.size())
+    return std::nullopt;
+  auto deviceTypeAttr = dyn_cast<DeviceTypeAttr>(attrs[index]);
+  if (!deviceTypeAttr)
+    return std::nullopt;
+  return deviceTypeAttr.getValue();
+}
+
+static bool getBoolAttrValue(std::optional<ArrayAttr> attrs, unsigned index) {
+  if (!attrs || !*attrs || index >= attrs->size())
     return false;
-  if (devnum)
-    waitDevnum = devnum;
-  waitOperands.append(waitValues.begin(), waitValues.end());
-  return true;
+  auto boolAttr = dyn_cast<BoolAttr>((*attrs)[index]);
+  return boolAttr && boolAttr.getValue();
 }
 
 template <typename ComputeConstructT>
-static void populateKernelEnvironmentAsyncWait(
-    ComputeConstructT computeConstruct, DeviceType deviceType,
-    std::optional<Value> &asyncOperand, UnitAttr &asyncOnly,
-    std::optional<Value> &waitDevnum, SmallVectorImpl<Value> &waitOperands,
-    UnitAttr &waitOnly) {
+static void
+populateKernelEnvironmentWait(ComputeConstructT computeConstruct,
+                              DeviceType deviceType,
+                              KernelEnvironmentOp kernelEnvironment) {
+  auto maybeSegments = computeConstruct.getWaitOperandsSegments();
+  std::optional<ArrayAttr> maybeDeviceTypes =
+      computeConstruct.getWaitOperandsDeviceType();
+  if (!maybeSegments || !maybeDeviceTypes || !*maybeDeviceTypes)
+    return;
+
+  ArrayRef<int32_t> segments = *maybeSegments;
+  ArrayAttr deviceTypes = *maybeDeviceTypes;
   MLIRContext *context = computeConstruct->getContext();
-
-  // Prefer device_type-specific clauses, then default ones.
-  if (!extractAsyncClause(computeConstruct, deviceType, context, asyncOperand,
-                          asyncOnly)) {
-    if (deviceType != DeviceType::None)
-      extractAsyncClause(computeConstruct, DeviceType::None, context,
-                         asyncOperand, asyncOnly);
-  }
-
-  if (!extractWaitClause(computeConstruct, deviceType, context, waitDevnum,
-                         waitOperands, waitOnly)) {
-    if (deviceType != DeviceType::None)
-      extractWaitClause(computeConstruct, DeviceType::None, context, waitDevnum,
-                        waitOperands, waitOnly);
+  for (DeviceType candidate :
+       getDeviceTypesByPrecedenceForKernelEnvironment(deviceType)) {
+    bool found = false;
+    unsigned operandOffset = 0;
+    for (auto [index, segmentSize] : llvm::enumerate(segments)) {
+      auto segmentDeviceType = getDeviceType(deviceTypes, index);
+      if (segmentDeviceType && *segmentDeviceType == candidate) {
+        found = true;
+        auto segmentValues = computeConstruct.getWaitOperands()
+                                 .drop_front(operandOffset)
+                                 .take_front(segmentSize);
+        bool hasDevnum =
+            getBoolAttrValue(computeConstruct.getHasWaitDevnum(), index);
+        bool waitAllQueues =
+            getBoolAttrValue(computeConstruct.getWaitAllQueues(), index);
+        if (waitAllQueues && !hasDevnum)
+          kernelEnvironment.addWaitOnly(context, {});
+        else
+          kernelEnvironment.addWaitOperands(context, hasDevnum, segmentValues,
+                                            {});
+      }
+      operandOffset += segmentSize;
+    }
+    if (found)
+      return;
   }
 }
 
@@ -387,17 +413,22 @@ KernelEnvironmentOp::createAndPopulate(ComputeConstructT computeConstruct,
                                        OpBuilder &builder) {
   std::optional<Value> asyncOperand;
   UnitAttr asyncOnly = nullptr;
-  std::optional<Value> waitDevnum;
-  SmallVector<Value> waitOperands;
-  UnitAttr waitOnly = nullptr;
-  populateKernelEnvironmentAsyncWait(computeConstruct, deviceType, asyncOperand,
-                                     asyncOnly, waitDevnum, waitOperands,
-                                     waitOnly);
+  MLIRContext *context = computeConstruct->getContext();
+  for (DeviceType candidate :
+       getDeviceTypesByPrecedenceForKernelEnvironment(deviceType))
+    if (extractAsyncClause(computeConstruct, candidate, context, asyncOperand,
+                           asyncOnly))
+      break;
 
   auto kernelEnvironment = KernelEnvironmentOp::create(
       builder, computeConstruct->getLoc(),
       computeConstruct.getDataClauseOperands(), asyncOperand.value_or(Value()),
-      asyncOnly, waitDevnum.value_or(Value()), waitOperands, waitOnly);
+      asyncOnly, /*waitOperands=*/ValueRange{},
+      /*waitOperandsSegments=*/nullptr,
+      /*waitOperandsDeviceType=*/nullptr, /*hasWaitDevnum=*/nullptr,
+      /*waitAllQueues=*/nullptr);
+  populateKernelEnvironmentWait(computeConstruct, deviceType,
+                                kernelEnvironment);
   Block &block = kernelEnvironment.getRegion().emplaceBlock();
   builder.setInsertionPointToStart(&block);
   return kernelEnvironment;
@@ -416,9 +447,177 @@ KernelEnvironmentOp::createAndPopulate<SerialOp>(SerialOp, DeviceType,
 LogicalResult KernelEnvironmentOp::verify() {
   if (getAsyncOnly() && getAsyncOperand())
     return emitError("async-only cannot appear with async operand");
-  if (getWaitOnly() && (!getWaitOperands().empty() || getWaitDevnum()))
-    return emitError("wait-only cannot appear with wait operands or devnum");
+  if (getWaitOperandsSegments()) {
+    std::size_t numOperandsInSegments = 0;
+    for (auto segCount : *getWaitOperandsSegments())
+      numOperandsInSegments += segCount;
+    if (numOperandsInSegments != getWaitOperands().size())
+      return emitError("wait operand count does not match count in segments");
+    if (!getWaitOperandsDeviceType() &&
+        (!getWaitOperands().empty() || numOperandsInSegments == 0))
+      return emitError("wait segment count does not match device_type count");
+    if (getWaitOperandsDeviceType() && getWaitOperandsDeviceType()->size() !=
+                                           getWaitOperandsSegments()->size())
+      return emitError("wait segment count does not match device_type count");
+  } else if (!getWaitOperands().empty()) {
+    return emitError("wait operand count does not match count in segments");
+  }
+  std::size_t numWaitSegments =
+      getWaitOperandsSegments() ? getWaitOperandsSegments()->size() : 0;
+  if (getHasWaitDevnumAttr() &&
+      getHasWaitDevnumAttr().size() != numWaitSegments)
+    return emitError("hasWaitDevnum count must match wait segment count");
+  if (getWaitAllQueuesAttr() &&
+      getWaitAllQueuesAttr().size() != numWaitSegments)
+    return emitError("waitAllQueues count must match wait segment count");
   return success();
+}
+
+static std::optional<unsigned>
+findKernelEnvironmentWaitSegment(KernelEnvironmentOp op,
+                                 DeviceType deviceType = DeviceType::None) {
+  std::optional<ArrayAttr> deviceTypes = op.getWaitOperandsDeviceType();
+  if (!deviceTypes || !*deviceTypes)
+    return std::nullopt;
+  unsigned segmentIdx = 0;
+  for (auto attr : *deviceTypes) {
+    auto deviceTypeAttr = dyn_cast<DeviceTypeAttr>(attr);
+    if (deviceTypeAttr && deviceTypeAttr.getValue() == deviceType)
+      return segmentIdx;
+    ++segmentIdx;
+  }
+  return std::nullopt;
+}
+
+static Operation::operand_range
+getKernelEnvironmentWaitSegmentValues(KernelEnvironmentOp op,
+                                      unsigned segmentIdx) {
+  if (!op.getWaitOperandsSegments() ||
+      segmentIdx >= op.getWaitOperandsSegments()->size())
+    return op.getWaitOperands().take_front(0);
+
+  int32_t nbOperandsBefore = 0;
+  for (unsigned i = 0; i < segmentIdx; ++i)
+    nbOperandsBefore += (*op.getWaitOperandsSegments())[i];
+  return op.getWaitOperands()
+      .drop_front(nbOperandsBefore)
+      .take_front((*op.getWaitOperandsSegments())[segmentIdx]);
+}
+
+unsigned KernelEnvironmentOp::getNumWaitSegments() {
+  if (!getWaitOperandsSegments())
+    return 0;
+  return getWaitOperandsSegments()->size();
+}
+
+bool KernelEnvironmentOp::hasWaitOnly(unsigned segmentIdx) {
+  if (!getWaitAllQueuesAttr() || segmentIdx >= getWaitAllQueuesAttr().size())
+    return false;
+  auto boolAttr = dyn_cast<BoolAttr>(getWaitAllQueuesAttr()[segmentIdx]);
+  return boolAttr && boolAttr.getValue();
+}
+
+bool KernelEnvironmentOp::hasWaitOnly() {
+  auto pos = findKernelEnvironmentWaitSegment(*this);
+  return pos ? hasWaitOnly(*pos) : false;
+}
+
+Operation::operand_range
+KernelEnvironmentOp::getWaitValues(unsigned segmentIdx) {
+  auto range = getKernelEnvironmentWaitSegmentValues(*this, segmentIdx);
+  if (range.empty())
+    return range;
+  if (getHasWaitDevnumAttr() && segmentIdx < getHasWaitDevnumAttr().size()) {
+    auto boolAttr = dyn_cast<BoolAttr>(getHasWaitDevnumAttr()[segmentIdx]);
+    if (boolAttr && boolAttr.getValue())
+      return range.drop_front(1);
+  }
+  return range;
+}
+
+Operation::operand_range KernelEnvironmentOp::getWaitValues() {
+  auto pos = findKernelEnvironmentWaitSegment(*this);
+  return pos ? getWaitValues(*pos) : getWaitOperands().take_front(0);
+}
+
+Value KernelEnvironmentOp::getWaitDevnum(unsigned segmentIdx) {
+  auto range = getKernelEnvironmentWaitSegmentValues(*this, segmentIdx);
+  if (range.empty())
+    return {};
+  if (getHasWaitDevnumAttr() && segmentIdx < getHasWaitDevnumAttr().size()) {
+    auto boolAttr = dyn_cast<BoolAttr>(getHasWaitDevnumAttr()[segmentIdx]);
+    if (boolAttr && boolAttr.getValue())
+      return range.front();
+  }
+  return {};
+}
+
+Value KernelEnvironmentOp::getWaitDevnum() {
+  auto pos = findKernelEnvironmentWaitSegment(*this);
+  return pos ? getWaitDevnum(*pos) : Value();
+}
+
+void KernelEnvironmentOp::addWaitOnly(
+    MLIRContext *context, llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
+  assert(effectiveDeviceTypes.empty());
+
+  SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
+  segments.push_back(0);
+  setWaitOperandsSegments(segments);
+
+  SmallVector<Attribute> deviceTypes;
+  if (getWaitOperandsDeviceTypeAttr())
+    llvm::copy(getWaitOperandsDeviceTypeAttr(),
+               std::back_inserter(deviceTypes));
+  deviceTypes.push_back(DeviceTypeAttr::get(context, DeviceType::None));
+  setWaitOperandsDeviceTypeAttr(ArrayAttr::get(context, deviceTypes));
+
+  SmallVector<Attribute> hasDevnums;
+  if (getHasWaitDevnumAttr())
+    llvm::copy(getHasWaitDevnumAttr(), std::back_inserter(hasDevnums));
+  hasDevnums.push_back(BoolAttr::get(context, false));
+  setHasWaitDevnumAttr(ArrayAttr::get(context, hasDevnums));
+
+  SmallVector<Attribute> waitAllQueues;
+  if (getWaitAllQueuesAttr())
+    llvm::copy(getWaitAllQueuesAttr(), std::back_inserter(waitAllQueues));
+  waitAllQueues.push_back(BoolAttr::get(context, true));
+  setWaitAllQueuesAttr(ArrayAttr::get(context, waitAllQueues));
+}
+
+void KernelEnvironmentOp::addWaitOperands(
+    MLIRContext *context, bool hasDevnum, ValueRange newValues,
+    llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
+  assert(effectiveDeviceTypes.empty());
+
+  SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
+  segments.push_back(newValues.size());
+  setWaitOperandsSegments(segments);
+
+  SmallVector<Attribute> deviceTypes;
+  if (getWaitOperandsDeviceTypeAttr())
+    llvm::copy(getWaitOperandsDeviceTypeAttr(),
+               std::back_inserter(deviceTypes));
+  deviceTypes.push_back(DeviceTypeAttr::get(context, DeviceType::None));
+  setWaitOperandsDeviceTypeAttr(ArrayAttr::get(context, deviceTypes));
+  getWaitOperandsMutable().append(newValues);
+
+  SmallVector<Attribute> hasDevnums;
+  if (getHasWaitDevnumAttr())
+    llvm::copy(getHasWaitDevnumAttr(), std::back_inserter(hasDevnums));
+  hasDevnums.push_back(BoolAttr::get(context, hasDevnum));
+  setHasWaitDevnumAttr(ArrayAttr::get(context, hasDevnums));
+
+  SmallVector<Attribute> waitAllQueues;
+  if (getWaitAllQueuesAttr())
+    llvm::copy(getWaitAllQueuesAttr(), std::back_inserter(waitAllQueues));
+  waitAllQueues.push_back(
+      BoolAttr::get(context, newValues.size() == (hasDevnum ? 1 : 0)));
+  setWaitAllQueuesAttr(ArrayAttr::get(context, waitAllQueues));
 }
 
 //===----------------------------------------------------------------------===//

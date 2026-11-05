@@ -85,20 +85,20 @@ subroutine acc_enter_data
   !$acc enter data create(a) wait(1)
 !CHECK: %[[CREATE_A:.*]] = acc.create varPtr(%[[DECLA]]#0 : !fir.ref<!fir.array<10x10xf32>>) structured(false) name("a") -> !fir.ref<!fir.array<10x10xf32>>
 !CHECK: %[[WAIT1:.*]] = arith.constant 1 : i32
-!CHECK: acc.enter_data wait(%[[WAIT1]] : i32) dataOperands(%[[CREATE_A]] : !fir.ref<!fir.array<10x10xf32>>)
+!CHECK: acc.enter_data wait({%[[WAIT1]] : i32}) dataOperands(%[[CREATE_A]] : !fir.ref<!fir.array<10x10xf32>>)
 
   !$acc enter data create(a) wait(queues: 1, 2)
 !CHECK: %[[CREATE_A:.*]] = acc.create varPtr(%[[DECLA]]#0 : !fir.ref<!fir.array<10x10xf32>>) structured(false) name("a") -> !fir.ref<!fir.array<10x10xf32>>
 !CHECK: %[[WAIT2:.*]] = arith.constant 1 : i32
 !CHECK: %[[WAIT3:.*]] = arith.constant 2 : i32
-!CHECK: acc.enter_data wait(%[[WAIT2]], %[[WAIT3]] : i32, i32) dataOperands(%[[CREATE_A]] : !fir.ref<!fir.array<10x10xf32>>)
+!CHECK: acc.enter_data wait({%[[WAIT2]] : i32, %[[WAIT3]] : i32}) dataOperands(%[[CREATE_A]] : !fir.ref<!fir.array<10x10xf32>>)
 
   !$acc enter data create(a) wait(devnum: 1: queues: 1, 2)
 !CHECK: %[[CREATE_A:.*]] = acc.create varPtr(%[[DECLA]]#0 : !fir.ref<!fir.array<10x10xf32>>) structured(false) name("a") -> !fir.ref<!fir.array<10x10xf32>>
 !CHECK: %[[WAIT4:.*]] = arith.constant 1 : i32
-!CHECK: %[[WAIT5:.*]] = arith.constant 2 : i32
-!CHECK: %[[WAIT6:.*]] = arith.constant 1 : i32
-!CHECK: acc.enter_data wait_devnum(%[[WAIT6]] : i32) wait(%[[WAIT4]], %[[WAIT5]] : i32, i32) dataOperands(%[[CREATE_A]] : !fir.ref<!fir.array<10x10xf32>>)
+!CHECK: %[[WAIT5:.*]] = arith.constant 1 : i32
+!CHECK: %[[WAIT6:.*]] = arith.constant 2 : i32
+!CHECK: acc.enter_data wait({devnum: %[[WAIT4]] : i32, %[[WAIT5]] : i32, %[[WAIT6]] : i32}) dataOperands(%[[CREATE_A]] : !fir.ref<!fir.array<10x10xf32>>)
 
   !$acc enter data copyin(a(1:10,1:5))
 !CHECK: %[[BOUND0:.*]] = acc.bounds lowerbound(%{{.*}} : index) upperbound(%{{.*}} : index) extent(%[[C10]] : index) stride(%c1{{.*}} : index) startIdx(%{{.*}} : index)

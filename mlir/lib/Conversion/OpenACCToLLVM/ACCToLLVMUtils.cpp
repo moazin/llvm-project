@@ -224,6 +224,20 @@ Value acc::castToI64(Location loc, Value value, OpBuilder &builder) {
   return arith::ExtSIOp::create(builder, loc, i64Ty, value);
 }
 
+Value acc::castToI32(Location loc, Value value, bool isUnsigned,
+                     OpBuilder &builder) {
+  Type i32Ty = builder.getI32Type();
+  unsigned bitwidth = value.getType().getIntOrFloatBitWidth();
+  if (bitwidth > 32)
+    return arith::TruncIOp::create(builder, loc, i32Ty, value);
+  if (bitwidth < 32) {
+    if (isUnsigned)
+      return arith::ExtUIOp::create(builder, loc, i32Ty, value);
+    return arith::ExtSIOp::create(builder, loc, i32Ty, value);
+  }
+  return value;
+}
+
 Value acc::getAsyncQueue(Location loc, Value asyncOperand, bool asyncOnly,
                          OpBuilder &builder,
                          const ACCRuntimeCallConfig &config) {

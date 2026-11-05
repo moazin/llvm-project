@@ -27,20 +27,6 @@ using namespace mlir;
 using namespace mlir::acc;
 
 namespace {
-static Value castToI32(Location loc, Value value, bool isUnsigned,
-                       ConversionPatternRewriter &rewriter) {
-  Type i32Ty = rewriter.getI32Type();
-  unsigned bitwidth = value.getType().getIntOrFloatBitWidth();
-  if (bitwidth > 32)
-    return arith::TruncIOp::create(rewriter, loc, i32Ty, value);
-  if (bitwidth < 32) {
-    if (isUnsigned)
-      return arith::ExtUIOp::create(rewriter, loc, i32Ty, value);
-    return arith::ExtSIOp::create(rewriter, loc, i32Ty, value);
-  }
-  return value;
-}
-
 template <typename OpTy>
 struct ACCExecutableDirectivePattern : public ConvertOpToLLVMPattern<OpTy> {
   ACCExecutableDirectivePattern(const LLVMTypeConverter &converter,
@@ -235,7 +221,6 @@ struct SetOpLowering : public ACCExecutableDirectivePattern<SetOp> {
     return success();
   }
 };
-
 } // namespace
 
 void mlir::configureACCExecutableDirectiveConversionLegality(

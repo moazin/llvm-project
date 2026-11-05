@@ -1818,7 +1818,7 @@ def OpenACC_ParallelOp
       OptionalAttr<DenseI32ArrayAttr>:$waitOperandsSegments,
       OptionalAttr<DeviceTypeArrayAttr>:$waitOperandsDeviceType,
       OptionalAttr<BoolArrayAttr>:$hasWaitDevnum,
-      OptionalAttr<DeviceTypeArrayAttr>:$waitOnly,
+      OptionalAttr<BoolArrayAttr>:$waitAllQueues,
       Variadic<IntOrIndex>:$numGangs,
       OptionalAttr<DenseI32ArrayAttr>:$numGangsSegments,
       OptionalAttr<DeviceTypeArrayAttr>:$numGangsDeviceType,
@@ -1974,7 +1974,7 @@ def OpenACC_ParallelOp
             type($vectorLength), $vectorLengthDeviceType) `)`
       | `wait` `` custom<WaitClause>($waitOperands, type($waitOperands),
           $waitOperandsDeviceType, $waitOperandsSegments, $hasWaitDevnum,
-          $waitOnly)
+          $waitAllQueues)
       | `self` `(` $selfCond `)`
       | `if` `(` $ifCond `)`
       | `reduction` `(` $reductionOperands `:` type($reductionOperands) `)`
@@ -2030,7 +2030,7 @@ def OpenACC_SerialOp
       OptionalAttr<DenseI32ArrayAttr>:$waitOperandsSegments,
       OptionalAttr<DeviceTypeArrayAttr>:$waitOperandsDeviceType,
       OptionalAttr<BoolArrayAttr>:$hasWaitDevnum,
-      OptionalAttr<DeviceTypeArrayAttr>:$waitOnly,
+      OptionalAttr<BoolArrayAttr>:$waitAllQueues,
       Optional<I1>:$ifCond,
       Optional<I1>:$selfCond,
       UnitAttr:$selfAttr,
@@ -2121,7 +2121,7 @@ def OpenACC_SerialOp
       | `private` `(` $privateOperands `:` type($privateOperands) `)`
       | `wait` `` custom<WaitClause>($waitOperands, type($waitOperands),
           $waitOperandsDeviceType, $waitOperandsSegments, $hasWaitDevnum,
-          $waitOnly)
+          $waitAllQueues)
       | `self` `(` $selfCond `)`
       | `if` `(` $ifCond `)`
       | `reduction` `(` $reductionOperands `:` type($reductionOperands) `)`
@@ -2179,7 +2179,7 @@ def OpenACC_KernelsOp
       OptionalAttr<DenseI32ArrayAttr>:$waitOperandsSegments,
       OptionalAttr<DeviceTypeArrayAttr>:$waitOperandsDeviceType,
       OptionalAttr<BoolArrayAttr>:$hasWaitDevnum,
-      OptionalAttr<DeviceTypeArrayAttr>:$waitOnly,
+      OptionalAttr<BoolArrayAttr>:$waitAllQueues,
       Variadic<IntOrIndex>:$numGangs,
       OptionalAttr<DenseI32ArrayAttr>:$numGangsSegments,
       OptionalAttr<DeviceTypeArrayAttr>:$numGangsDeviceType,
@@ -2317,7 +2317,7 @@ def OpenACC_KernelsOp
             type($vectorLength), $vectorLengthDeviceType) `)`
       | `wait` `` custom<WaitClause>($waitOperands, type($waitOperands),
           $waitOperandsDeviceType, $waitOperandsSegments, $hasWaitDevnum,
-          $waitOnly)
+          $waitAllQueues)
       | `self` `(` $selfCond `)`
       | `if` `(` $ifCond `)`
       | `reduction` `(` $reductionOperands `:` type($reductionOperands) `)`
@@ -2376,7 +2376,7 @@ def OpenACC_DataOp
       OptionalAttr<DenseI32ArrayAttr>:$waitOperandsSegments,
       OptionalAttr<DeviceTypeArrayAttr>:$waitOperandsDeviceType,
       OptionalAttr<BoolArrayAttr>:$hasWaitDevnum,
-      OptionalAttr<DeviceTypeArrayAttr>:$waitOnly,
+      OptionalAttr<BoolArrayAttr>:$waitAllQueues,
       Variadic<OpenACC_AnyPointerOrMappableType>:$dataClauseOperands,
       OptionalAttr<DefaultValueAttr>:$defaultAttr);
 
@@ -2441,7 +2441,7 @@ def OpenACC_DataOp
       | `dataOperands` `(` $dataClauseOperands `:` type($dataClauseOperands) `)`
       | `wait` `` custom<WaitClause>($waitOperands, type($waitOperands),
           $waitOperandsDeviceType, $waitOperandsSegments, $hasWaitDevnum,
-          $waitOnly)
+          $waitAllQueues)
     )
     $region
     (`defaultAttr` `(` enum($defaultAttr)^ `)`)?
@@ -2490,9 +2490,11 @@ def OpenACC_EnterDataOp : OpenACC_Op<"enter_data",
   let arguments = (ins Optional<I1>:$ifCond,
                        Optional<IntOrIndex>:$asyncOperand,
                        UnitAttr:$async,
-                       Optional<IntOrIndex>:$waitDevnum,
                        Variadic<IntOrIndex>:$waitOperands,
-                       UnitAttr:$wait,
+                       OptionalAttr<DenseI32ArrayAttr>:$waitOperandsSegments,
+                       OptionalAttr<DeviceTypeArrayAttr>:$waitOperandsDeviceType,
+                       OptionalAttr<BoolArrayAttr>:$hasWaitDevnum,
+                       OptionalAttr<BoolArrayAttr>:$waitAllQueues,
                        Variadic<OpenACC_AnyPointerOrMappableType>:$dataClauseOperands);
 
   let extraClassDeclaration = [{
@@ -2511,6 +2513,22 @@ def OpenACC_EnterDataOp : OpenACC_Op<"enter_data",
     /// function.
     void addAsyncOperand(MLIRContext *, mlir::Value,
                          llvm::ArrayRef<DeviceType>);
+    /// Return true if the op has the wait attribute for the
+    /// mlir::acc::DeviceType::None device_type.
+    bool hasWaitOnly();
+    /// Return true if the op has the wait attribute for the given device_type.
+    bool hasWaitOnly(mlir::acc::DeviceType deviceType);
+    /// Return the values of the wait clause if present.
+    mlir::Operation::operand_range getWaitValues();
+    /// Return the values of the wait clause for the given device_type if
+    /// present.
+    mlir::Operation::operand_range
+    getWaitValues(mlir::acc::DeviceType deviceType);
+    /// Return the wait devnum value clause if present;
+    mlir::Value getWaitDevnum();
+    /// Return the wait devnum value clause for the given device_type if
+    /// present.
+    mlir::Value getWaitDevnum(mlir::acc::DeviceType deviceType);
     /// Add an entry to the 'wait-only' attribute (clause spelled without
     /// arguments). DeviceType array is supplied even though it should always be
     /// empty, so this can mirror other versions of this function.
@@ -2527,9 +2545,9 @@ def OpenACC_EnterDataOp : OpenACC_Op<"enter_data",
         `if` `(` $ifCond `)`
       | `async` `` custom<OperandWithKeywordOnly>($asyncOperand,
             type($asyncOperand), $async)
-      | `wait_devnum` `(` $waitDevnum `:` type($waitDevnum) `)`
-      | `wait` `` custom<OperandsWithKeywordOnly>($waitOperands,
-            type($waitOperands), $wait)
+      | `wait` `` custom<WaitClause>($waitOperands, type($waitOperands),
+          $waitOperandsDeviceType, $waitOperandsSegments, $hasWaitDevnum,
+          $waitAllQueues)
       | `dataOperands` `(` $dataClauseOperands `:` type($dataClauseOperands) `)`
     )
     attr-dict-with-keyword
@@ -2562,9 +2580,11 @@ def OpenACC_ExitDataOp : OpenACC_Op<"exit_data",
   let arguments = (ins Optional<I1>:$ifCond,
                        Optional<IntOrIndex>:$asyncOperand,
                        UnitAttr:$async,
-                       Optional<IntOrIndex>:$waitDevnum,
                        Variadic<IntOrIndex>:$waitOperands,
-                       UnitAttr:$wait,
+                       OptionalAttr<DenseI32ArrayAttr>:$waitOperandsSegments,
+                       OptionalAttr<DeviceTypeArrayAttr>:$waitOperandsDeviceType,
+                       OptionalAttr<BoolArrayAttr>:$hasWaitDevnum,
+                       OptionalAttr<BoolArrayAttr>:$waitAllQueues,
                        Variadic<OpenACC_AnyPointerOrMappableType>:$dataClauseOperands,
                        UnitAttr:$finalize);
 
@@ -2585,6 +2605,22 @@ def OpenACC_ExitDataOp : OpenACC_Op<"exit_data",
     void addAsyncOperand(MLIRContext *, mlir::Value,
                          llvm::ArrayRef<DeviceType>);
 
+    /// Return true if the op has the wait attribute for the
+    /// mlir::acc::DeviceType::None device_type.
+    bool hasWaitOnly();
+    /// Return true if the op has the wait attribute for the given device_type.
+    bool hasWaitOnly(mlir::acc::DeviceType deviceType);
+    /// Return the values of the wait clause if present.
+    mlir::Operation::operand_range getWaitValues();
+    /// Return the values of the wait clause for the given device_type if
+    /// present.
+    mlir::Operation::operand_range
+    getWaitValues(mlir::acc::DeviceType deviceType);
+    /// Return the wait devnum value clause if present;
+    mlir::Value getWaitDevnum();
+    /// Return the wait devnum value clause for the given device_type if
+    /// present.
+    mlir::Value getWaitDevnum(mlir::acc::DeviceType deviceType);
     /// Add an entry to the 'wait-only' attribute (clause spelled without
     /// arguments). DeviceType array is supplied even though it should always be
     /// empty, so this can mirror other versions of this function.
@@ -2601,9 +2637,9 @@ def OpenACC_ExitDataOp : OpenACC_Op<"exit_data",
         `if` `(` $ifCond `)`
       | `async` `` custom<OperandWithKeywordOnly>($asyncOperand,
             type($asyncOperand), $async)
-      | `wait_devnum` `(` $waitDevnum `:` type($waitDevnum) `)`
-      | `wait` `` custom<OperandsWithKeywordOnly>($waitOperands,
-            type($waitOperands), $wait)
+      | `wait` `` custom<WaitClause>($waitOperands, type($waitOperands),
+          $waitOperandsDeviceType, $waitOperandsSegments, $hasWaitDevnum,
+          $waitAllQueues)
       | `dataOperands` `(` $dataClauseOperands `:` type($dataClauseOperands) `)`
       | `finalize` $finalize
     )
@@ -3726,7 +3762,7 @@ def OpenACC_UpdateOp : OpenACC_Op<"update",
       OptionalAttr<DenseI32ArrayAttr>:$waitOperandsSegments,
       OptionalAttr<DeviceTypeArrayAttr>:$waitOperandsDeviceType,
       OptionalAttr<BoolArrayAttr>:$hasWaitDevnum,
-      OptionalAttr<DeviceTypeArrayAttr>:$waitOnly,
+      OptionalAttr<BoolArrayAttr>:$waitAllQueues,
       Variadic<OpenACC_AnyPointerOrMappableType>:$dataClauseOperands,
       UnitAttr:$ifPresent);
 
@@ -3788,7 +3824,7 @@ def OpenACC_UpdateOp : OpenACC_Op<"update",
             type($asyncOperands), $asyncOperandsDeviceType, $asyncOnly)
       | `wait` `` custom<WaitClause>($waitOperands, type($waitOperands),
           $waitOperandsDeviceType, $waitOperandsSegments, $hasWaitDevnum,
-          $waitOnly)
+          $waitAllQueues)
       | `dataOperands` `(` $dataClauseOperands `:` type($dataClauseOperands) `)`
       | `ifPresent` $ifPresent
     )

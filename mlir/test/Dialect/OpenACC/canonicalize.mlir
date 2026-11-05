@@ -227,13 +227,13 @@ func.func @kernel_environment_canonicalization(%q1: i32, %q2: i32, %q3: i32) {
   acc.kernel_environment {
   }
 
-  acc.kernel_environment wait(%q1, %q2 : i32, i32) {
+  acc.kernel_environment wait({%q1 : i32, %q2 : i32}) {
   }
 
   acc.kernel_environment wait {
   }
 
-  acc.kernel_environment wait(%q3 : i32) {
+  acc.kernel_environment wait({%q3 : i32}) {
   }
 
   return

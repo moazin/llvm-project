@@ -28,7 +28,6 @@
 
 namespace mlir {
 namespace acc {
-
 /// Unfuses fused locations, returning the last sub-location.
 Location unfuseLoc(Location loc);
 
@@ -78,6 +77,10 @@ Value createIdent(Location loc, StringRef functionName, OpBuilder &builder,
 /// Sign-extends or truncates \p value to the i64 the runtime entry points take
 /// for values like queue numbers.
 Value castToI64(Location loc, Value value, OpBuilder &builder);
+
+/// Extends or truncates \p value to the i32 the runtime entry points take for
+/// device numbers.
+Value castToI32(Location loc, Value value, bool isUnsigned, OpBuilder &builder);
 
 /// Returns the queue an `async` clause selects: the value of the clause when it
 /// has one, the queue standing for an `async` clause without a value when
@@ -147,17 +150,77 @@ SmallVector<DeviceType, 3> getDeviceTypesByPrecedence(DeviceType deviceType);
 
 namespace detail {
 /// The constructs carrying a `device_type` clause hold their async and wait
-/// clauses per device type. The others, such as `acc.enter_data` or
-/// `acc.kernel_environment`, hold a single value for each clause, spelling the
-/// value-less form either `asyncOnly`/`waitOnly` or `async`/`wait`.
+/// clauses per device type. Some constructs without `device_type` clauses use
+/// the same segmented wait representation under `DeviceType::None`; older
+/// shapes hold a single value for each clause, spelling the value-less form
+/// either `asyncOnly`/`waitOnly` or `async`/`wait`.
 template <typename OpTy>
 using has_device_type_clauses_t =
     decltype(std::declval<OpTy>().hasAsyncOnly(DeviceType::None));
 template <typename OpTy>
+using has_segmented_wait_t =
+    decltype(std::declval<OpTy>().getWaitOperandsSegments());
+template <typename OpTy>
 using has_async_only_t = decltype(std::declval<OpTy>().getAsyncOnly());
 template <typename OpTy>
 using has_wait_only_t = decltype(std::declval<OpTy>().getWaitOnly());
+
+inline bool getBoolAttrValue(std::optional<ArrayAttr> attrs, unsigned index) {
+  if (!attrs || !*attrs || index >= attrs->size())
+    return false;
+  auto boolAttr = dyn_cast<BoolAttr>((*attrs)[index]);
+  return boolAttr && boolAttr.getValue();
+}
+
+inline std::optional<DeviceType> getDeviceType(ArrayAttr attrs,
+                                               unsigned index) {
+  if (index >= attrs.size())
+    return std::nullopt;
+  auto deviceTypeAttr = dyn_cast<DeviceTypeAttr>(attrs[index]);
+  if (!deviceTypeAttr)
+    return std::nullopt;
+  return deviceTypeAttr.getValue();
+}
 } // namespace detail
+
+template <typename OpTy, typename Fn>
+LogicalResult forEachSegmentedWaitClause(OpTy op, DeviceType deviceType,
+                                         Fn &&fn) {
+  auto maybeSegments = op.getWaitOperandsSegments();
+  std::optional<ArrayAttr> maybeDeviceTypes = op.getWaitOperandsDeviceType();
+  if (!maybeSegments || !maybeDeviceTypes || !*maybeDeviceTypes)
+    return success();
+
+  ArrayRef<int32_t> segments = *maybeSegments;
+  ArrayAttr deviceTypes = *maybeDeviceTypes;
+  for (DeviceType candidate : getDeviceTypesByPrecedence(deviceType)) {
+    bool found = false;
+    unsigned operandOffset = 0;
+    for (auto [index, segmentSize] : llvm::enumerate(segments)) {
+      auto segmentDeviceType = detail::getDeviceType(deviceTypes, index);
+      if (segmentDeviceType && *segmentDeviceType == candidate) {
+        found = true;
+        auto segmentValues = op.getWaitOperands()
+                                 .drop_front(operandOffset)
+                                 .take_front(segmentSize);
+        Value waitDevnum;
+        bool hasDevnum = detail::getBoolAttrValue(op.getHasWaitDevnum(), index);
+        if (hasDevnum && !segmentValues.empty()) {
+          waitDevnum = segmentValues.front();
+          segmentValues = segmentValues.drop_front(1);
+        }
+        bool waitAllQueues =
+            detail::getBoolAttrValue(op.getWaitAllQueues(), index);
+        if (failed(fn(candidate, waitDevnum, segmentValues, waitAllQueues)))
+          return failure();
+      }
+      operandOffset += segmentSize;
+    }
+    if (found)
+      return success();
+  }
+  return success();
+}
 
 /// Returns the value the `async` clause of \p op names for \p deviceType, and
 /// sets \p asyncOnly when the clause names no queue. The value is the one the
@@ -208,6 +271,16 @@ getWaitClauseValues(OpTy op, DeviceType deviceType,
       }
     }
     return std::nullopt;
+  } else if constexpr (llvm::is_detected<detail::has_segmented_wait_t,
+                                         OpTy>::value) {
+    if (op.hasWaitOnly())
+      return DeviceType::None;
+    auto values = op.getWaitValues();
+    if (!values.empty()) {
+      llvm::append_range(waitValues, values);
+      return DeviceType::None;
+    }
+    return std::nullopt;
   } else {
     llvm::append_range(waitValues, op.getWaitOperands());
     bool waitsForEveryQueue;
@@ -232,6 +305,9 @@ bool hasWaitDevnum(OpTy op, DeviceType deviceType) {
   if constexpr (llvm::is_detected<detail::has_device_type_clauses_t,
                                   OpTy>::value) {
     return static_cast<bool>(op.getWaitDevnum(deviceType));
+  } else if constexpr (llvm::is_detected<detail::has_segmented_wait_t,
+                                         OpTy>::value) {
+    return static_cast<bool>(op.getWaitDevnum());
   } else {
     return static_cast<bool>(op.getWaitDevnum());
   }
@@ -250,33 +326,68 @@ Value getAsyncQueue(OpTy op, DeviceType deviceType,
   return getAsyncQueue(op.getLoc(), asyncValue, asyncOnly, rewriter, config);
 }
 
-/// Emits the wait that a `wait` clause on \p op asks for before the runtime
-/// calls of the construct, waiting on \p asyncQueue for the queues the clause
-/// names, or for every queue when it names none. Nothing is emitted when there
-/// is no such clause for \p deviceType. A devnum modifier, which selects the
-/// device the queues belong to, is reported through \p accSupport as not yet
-/// implemented.
+/// Emits the waits that `wait` clauses on \p op ask for before the runtime
+/// calls of the construct, waiting on \p asyncQueue for the queues each clause
+/// names, or for every queue when a clause names none. Nothing is emitted when
+/// there is no such clause for \p deviceType.
 template <typename OpTy>
 LogicalResult
 emitWaitClause(OpTy op, DeviceType deviceType, Value asyncQueue,
                ConversionPatternRewriter &rewriter, OpenACCSupport &accSupport,
                Region &globalSymbolRegion, SymbolTable &symbolTable,
                const ACCRuntimeCallConfig &config) {
-  SmallVector<Value> waitValues;
-  std::optional<DeviceType> clauseDeviceType =
-      getWaitClauseValues(op, deviceType, waitValues);
-  if (!clauseDeviceType)
-    return success();
-  if (hasWaitDevnum(op, *clauseDeviceType)) {
-    (void)accSupport.emitNYI(op.getLoc(), "wait clause with a devnum modifier");
-    return failure();
-  }
-  for (Value &waitValue : waitValues)
-    waitValue = rewriter.getRemappedValue(waitValue);
-  return emitWaitCall(op.getLoc(), waitValues, asyncQueue, rewriter,
-                      globalSymbolRegion, symbolTable, config);
-}
+  (void)accSupport;
+  if constexpr (llvm::is_detected<detail::has_segmented_wait_t, OpTy>::value) {
+    return forEachSegmentedWaitClause(
+        op, deviceType,
+        [&](DeviceType, Value waitDevnum, auto waitValues,
+            bool waitAllQueues) -> LogicalResult {
+          if (!waitAllQueues && !waitDevnum && waitValues.empty())
+            return success();
+          SmallVector<Value> remappedWaitValues;
+          remappedWaitValues.reserve(waitValues.size());
+          for (Value waitValue : waitValues)
+            remappedWaitValues.push_back(rewriter.getRemappedValue(waitValue));
 
+          Value remappedDevnum;
+          if (waitDevnum) {
+            remappedDevnum = rewriter.getRemappedValue(waitDevnum);
+            remappedDevnum =
+                castToI32(op.getLoc(), remappedDevnum,
+                          waitDevnum.getType().isUnsignedInteger(), rewriter);
+          }
+
+          return emitWaitCall(op.getLoc(), remappedWaitValues, asyncQueue,
+                              rewriter, globalSymbolRegion, symbolTable, config,
+                              remappedDevnum);
+        });
+  } else {
+    SmallVector<Value> waitValues;
+    llvm::append_range(waitValues, op.getWaitOperands());
+    bool waitsForEveryQueue;
+    if constexpr (llvm::is_detected<detail::has_wait_only_t, OpTy>::value)
+      waitsForEveryQueue = op.getWaitOnly();
+    else
+      waitsForEveryQueue = op.getWait();
+    Value waitDevnum = op.getWaitDevnum();
+    if (!waitsForEveryQueue && waitValues.empty() && !waitDevnum)
+      return success();
+
+    for (Value &waitValue : waitValues)
+      waitValue = rewriter.getRemappedValue(waitValue);
+
+    Value remappedDevnum;
+    if (waitDevnum) {
+      remappedDevnum = rewriter.getRemappedValue(waitDevnum);
+      remappedDevnum =
+          castToI32(op.getLoc(), remappedDevnum,
+                    waitDevnum.getType().isUnsignedInteger(), rewriter);
+    }
+    return emitWaitCall(op.getLoc(), waitValues, asyncQueue, rewriter,
+                        globalSymbolRegion, symbolTable, config,
+                        remappedDevnum);
+  }
+}
 } // namespace acc
 } // namespace mlir
 

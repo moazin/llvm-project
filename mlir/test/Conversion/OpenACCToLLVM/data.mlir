@@ -173,6 +173,51 @@ func.func @enter_data_wait_all(%arg0: !llvm.ptr) {
 
 // -----
 
+// Multiple wait clauses emit one runtime wait per clause before the mapping
+// call.
+// CHECK-LABEL: llvm.func @enter_data_multiple_waits
+// CHECK: %[[Q1:.*]] = llvm.mlir.constant(1 : i64) : i64
+// CHECK: llvm.store %[[Q1]], %{{.*}} : i64, !llvm.ptr
+// CHECK: llvm.call @__tgt_acc_wait
+// CHECK: %[[Q2:.*]] = llvm.mlir.constant(2 : i64) : i64
+// CHECK: llvm.store %[[Q2]], %{{.*}} : i64, !llvm.ptr
+// CHECK: llvm.call @__tgt_acc_wait
+// CHECK: llvm.call @__tgt_acc_data_enter
+func.func @enter_data_multiple_waits(%arg0: !llvm.ptr) {
+  %q1 = arith.constant 1 : i32
+  %q2 = arith.constant 2 : i32
+  %size = arith.constant 4 : i64
+  %map = acc.map_info varPtr(%arg0 : !llvm.ptr) varType(i32)
+      size(%size : i64) elementSize(4) name("n")
+      descKind(none) mapFlags(to) -> !llvm.ptr
+  acc.enter_data dataOperands(%map : !llvm.ptr)
+      wait({%q1 : i32}, {%q2 : i32})
+  return
+}
+
+// -----
+
+// A wait clause with devnum passes the selected device number to the runtime.
+// CHECK-LABEL: llvm.func @enter_data_wait_devnum
+// CHECK: %[[DEVNUM:.*]] = llvm.mlir.constant(4 : i32) : i32
+// CHECK: %[[QUEUE:.*]] = llvm.mlir.constant(7 : i64) : i64
+// CHECK: llvm.store %[[QUEUE]], %{{.*}} : i64, !llvm.ptr
+// CHECK: llvm.call @__tgt_acc_wait(%{{[^,]+}}, %{{[^,]+}}, %{{[^,]+}}, %[[DEVNUM]],
+// CHECK: llvm.call @__tgt_acc_data_enter
+func.func @enter_data_wait_devnum(%arg0: !llvm.ptr) {
+  %devnum = arith.constant 4 : i32
+  %queue = arith.constant 7 : i32
+  %size = arith.constant 4 : i64
+  %map = acc.map_info varPtr(%arg0 : !llvm.ptr) varType(i32)
+      size(%size : i64) elementSize(4) name("n")
+      descKind(none) mapFlags(to) -> !llvm.ptr
+  acc.enter_data dataOperands(%map : !llvm.ptr)
+      wait({devnum: %devnum : i32, %queue : i32})
+  return
+}
+
+// -----
+
 // Other entry operations use the same runtime-argument emission and keep the
 // flags of their clause: present, no_create, deviceptr and attach. The address
 // of a device pointer is one the runtime must not look up, so it is handed over
@@ -277,12 +322,12 @@ func.func @data_async_chain(%arg0: !llvm.ptr) {
       size(%size : i64) elementSize(4) descKind(none)
       mapFlags(to) -> !llvm.ptr
   acc.enter_data dataOperands(%enterMap : !llvm.ptr) async(%q300 : i32)
-      wait(%q100 : i32)
+      wait({%q100 : i32})
   %exitMap = acc.map_info varPtr(%arg0 : !llvm.ptr) varType(i32)
       size(%size : i64) elementSize(4) descKind(none)
       mapFlags(from) -> !llvm.ptr
   acc.exit_data dataOperands(%exitMap : !llvm.ptr) async(%q400 : i32)
-      wait(%q300 : i32)
+      wait({%q300 : i32})
   return
 }
 

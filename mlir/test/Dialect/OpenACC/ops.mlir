@@ -1242,7 +1242,7 @@ func.func @testexitdataop(%a: !llvm.ptr) -> () {
   acc.copyout accPtr(%8 : !llvm.ptr) to varPtr(%a : !llvm.ptr) varType(f64)
 
   %9 = acc.getdeviceptr varPtr(%a : !llvm.ptr) varType(f64) -> !llvm.ptr
-  acc.exit_data wait_devnum(%i64Value: i64) wait(%i32Value, %idxValue : i32, index) dataOperands(%9 : !llvm.ptr)
+  acc.exit_data wait({devnum: %i64Value : i64, %i32Value : i32, %idxValue : index}) dataOperands(%9 : !llvm.ptr)
   acc.copyout accPtr(%9 : !llvm.ptr) to varPtr(%a : !llvm.ptr) varType(f64)
 
   return
@@ -1291,7 +1291,7 @@ func.func @testexitdataop(%a: !llvm.ptr) -> () {
 // CHECK: acc.copyout accPtr(%[[DEVPTR]] : !llvm.ptr) to varPtr(%[[ARGA]] : !llvm.ptr) varType(f64)
 
 // CHECK: %[[DEVPTR:.*]] = acc.getdeviceptr varPtr(%[[ARGA]] : !llvm.ptr) varType(f64) -> !llvm.ptr
-// CHECK: acc.exit_data wait_devnum(%[[I64VALUE]] : i64) wait(%[[I32VALUE]], %[[IDXVALUE]] : i32, index) dataOperands(%[[DEVPTR]] : !llvm.ptr)
+// CHECK: acc.exit_data wait({devnum: %[[I64VALUE]] : i64, %[[I32VALUE]] : i32, %[[IDXVALUE]] : index}) dataOperands(%[[DEVPTR]] : !llvm.ptr)
 // CHECK: acc.copyout accPtr(%[[DEVPTR]] : !llvm.ptr) to varPtr(%[[ARGA]] : !llvm.ptr) varType(f64)
 
 // -----
@@ -1322,7 +1322,7 @@ func.func @testenterdataop(%a: !llvm.ptr, %b: !llvm.ptr, %c: !llvm.ptr) -> () {
   %9 = acc.copyin varPtr(%a : !llvm.ptr) varType(f64) -> !llvm.ptr
   acc.enter_data if(%ifCond) dataOperands(%9 : !llvm.ptr)
   %10 = acc.copyin varPtr(%a : !llvm.ptr) varType(f64) -> !llvm.ptr
-  acc.enter_data wait_devnum(%i64Value: i64) wait(%i32Value, %idxValue : i32, index) dataOperands(%10 : !llvm.ptr)
+  acc.enter_data wait({devnum: %i64Value : i64, %i32Value : i32, %idxValue : index}) dataOperands(%10 : !llvm.ptr)
 
   return
 }
@@ -1351,7 +1351,7 @@ func.func @testenterdataop(%a: !llvm.ptr, %b: !llvm.ptr, %c: !llvm.ptr) -> () {
 // CHECK: %[[COPYIN:.*]] = acc.copyin varPtr(%[[ARGA]] : !llvm.ptr) varType(f64) -> !llvm.ptr
 // CHECK: acc.enter_data if([[IFCOND]]) dataOperands(%[[COPYIN]] : !llvm.ptr)
 // CHECK: %[[COPYIN:.*]] = acc.copyin varPtr(%[[ARGA]] : !llvm.ptr) varType(f64) -> !llvm.ptr
-// CHECK: acc.enter_data wait_devnum([[I64VALUE]] : i64) wait([[I32VALUE]], [[IDXVALUE]] : i32, index) dataOperands(%[[COPYIN]] : !llvm.ptr)
+// CHECK: acc.enter_data wait({devnum: [[I64VALUE]] : i64, [[I32VALUE]] : i32, [[IDXVALUE]] : index}) dataOperands(%[[COPYIN]] : !llvm.ptr)
 
 // -----
 

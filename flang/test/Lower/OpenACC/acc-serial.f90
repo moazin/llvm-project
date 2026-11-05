@@ -87,7 +87,7 @@ subroutine acc_serial
   !$acc serial device_type(nvidia) wait
   !$acc end serial
 
-! CHECK: acc.serial wait([#acc.device_type<nvidia>])
+! CHECK: acc.serial wait({} [#acc.device_type<nvidia>])
 
   !$acc serial wait(1)
   !$acc end serial

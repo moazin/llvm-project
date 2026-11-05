@@ -39,7 +39,6 @@ using namespace acc;
 #include "mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.cpp.inc"
 
 namespace {
-
 static bool isScalarLikeType(Type type) {
   return type.isIntOrIndexOrFloat() || isa<ComplexType>(type);
 }
@@ -500,6 +499,18 @@ mlir::ArrayAttr addDeviceTypeAffectedOperandHelper(
                                             newDeviceTypes, arguments,
                                             argCollection, segments);
 }
+
+mlir::ArrayAttr addDeviceTypeSegmentFlagHelper(
+    MLIRContext *context, mlir::ArrayAttr existingFlags,
+    llvm::ArrayRef<acc::DeviceType> newDeviceTypes, bool value) {
+  llvm::SmallVector<mlir::Attribute> flags;
+  if (existingFlags)
+    llvm::copy(existingFlags, std::back_inserter(flags));
+  flags.insert(flags.end(),
+               std::max(newDeviceTypes.size(), static_cast<size_t>(1)),
+               mlir::BoolAttr::get(context, value));
+  return mlir::ArrayAttr::get(context, flags);
+}
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -823,6 +834,20 @@ getWaitValuesWithoutDevnum(std::optional<mlir::ArrayAttr> deviceTypeAttr,
   return range;
 }
 
+static bool hasWaitAllQueues(std::optional<mlir::ArrayAttr> deviceTypeAttr,
+                             std::optional<mlir::ArrayAttr> waitAllQueues,
+                             mlir::acc::DeviceType deviceType) {
+  if (!hasDeviceTypeValues(deviceTypeAttr) || !waitAllQueues || !*waitAllQueues)
+    return false;
+  if (auto pos = findSegment(*deviceTypeAttr, deviceType)) {
+    if (*pos >= waitAllQueues->size())
+      return false;
+    auto boolAttr = mlir::dyn_cast<mlir::BoolAttr>((*waitAllQueues)[*pos]);
+    return boolAttr && boolAttr.getValue();
+  }
+  return false;
+}
+
 template <typename Op>
 static LogicalResult checkWaitAndAsyncConflict(Op op) {
   for (uint32_t dtypeInt = 0; dtypeInt != acc::getMaxEnumValForDeviceType();
@@ -835,12 +860,6 @@ static LogicalResult checkWaitAndAsyncConflict(Op op) {
         op.hasAsyncOnly(dtype))
       return op.emitError(
           "asyncOnly attribute cannot appear with asyncOperand");
-
-    // The wait attribute represent the wait clause without values. Therefore
-    // the attribute and operands cannot appear at the same time.
-    if (hasDeviceType(op.getWaitOperandsDeviceType(), dtype) &&
-        op.hasWaitOnly(dtype))
-      return op.emitError("wait attribute cannot appear with waitOperands");
   }
   return success();
 }
@@ -1926,7 +1945,6 @@ createDestroyRegion(OpBuilder &builder, Location loc, Region &destroyRegion,
   acc::TerminatorOp::create(builder, loc);
   return success();
 }
-
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -2253,6 +2271,25 @@ static LogicalResult verifyDeviceTypeAndSegmentCountMatch(
   return success();
 }
 
+template <typename Op>
+static LogicalResult verifyWaitSegmentAttrCountMatch(Op op) {
+  std::size_t nbOfSegments = 0;
+  if (auto segments = op.getWaitOperandsSegments())
+    nbOfSegments = segments->size();
+
+  if (auto hasWaitDevnum = op.getHasWaitDevnumAttr())
+    if (hasWaitDevnum.size() != nbOfSegments)
+      return op.emitOpError()
+             << "hasWaitDevnum count must match wait segment count";
+
+  if (auto waitAllQueues = op.getWaitAllQueuesAttr())
+    if (waitAllQueues.size() != nbOfSegments)
+      return op.emitOpError()
+             << "waitAllQueues count must match wait segment count";
+
+  return success();
+}
+
 LogicalResult acc::ParallelOp::verify() {
   if (failed(checkPrivateOperands<mlir::acc::PrivateOp,
                                   mlir::acc::PrivateRecipeOp>(
@@ -2275,6 +2312,8 @@ LogicalResult acc::ParallelOp::verify() {
   if (failed(verifyDeviceTypeAndSegmentCountMatch(
           *this, getWaitOperands(), getWaitOperandsSegmentsAttr(),
           getWaitOperandsDeviceTypeAttr(), "wait")))
+    return failure();
+  if (failed(verifyWaitSegmentAttrCountMatch(*this)))
     return failure();
 
   if (failed(verifyDeviceTypeCountMatch(*this, getNumWorkers(),
@@ -2390,7 +2429,8 @@ bool acc::ParallelOp::hasWaitOnly() {
 }
 
 bool acc::ParallelOp::hasWaitOnly(mlir::acc::DeviceType deviceType) {
-  return hasDeviceType(getWaitOnly(), deviceType);
+  return hasWaitAllQueues(getWaitOperandsDeviceType(), getWaitAllQueues(),
+                          deviceType);
 }
 
 mlir::Operation::operand_range ParallelOp::getWaitValues() {
@@ -2428,7 +2468,7 @@ void ParallelOp::build(mlir::OpBuilder &odsBuilder,
       odsBuilder, odsState, asyncOperands, /*asyncOperandsDeviceType=*/nullptr,
       /*asyncOnly=*/nullptr, waitOperands, /*waitOperandsSegments=*/nullptr,
       /*waitOperandsDeviceType=*/nullptr, /*hasWaitDevnum=*/nullptr,
-      /*waitOnly=*/nullptr, numGangs, /*numGangsSegments=*/nullptr,
+      /*waitAllQueues=*/nullptr, numGangs, /*numGangsSegments=*/nullptr,
       /*numGangsDeviceType=*/nullptr, numWorkers,
       /*numWorkersDeviceType=*/nullptr, vectorLength,
       /*vectorLengthDeviceType=*/nullptr, ifCond, selfCond,
@@ -2481,8 +2521,17 @@ void acc::ParallelOp::addNumGangsOperands(
 }
 void acc::ParallelOp::addWaitOnly(
     MLIRContext *context, llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
-  setWaitOnlyAttr(addDeviceTypeAffectedOperandHelper(context, getWaitOnlyAttr(),
-                                                     effectiveDeviceTypes));
+  llvm::SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
+  setWaitOperandsDeviceTypeAttr(addDeviceTypeAffectedOperandHelper(
+      context, getWaitOperandsDeviceTypeAttr(), effectiveDeviceTypes,
+      /*arguments=*/{}, getWaitOperandsMutable(), segments));
+  setWaitOperandsSegments(segments);
+  setHasWaitDevnumAttr(addDeviceTypeSegmentFlagHelper(
+      context, getHasWaitDevnumAttr(), effectiveDeviceTypes, false));
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, true));
 }
 void acc::ParallelOp::addWaitOperands(
     MLIRContext *context, bool hasDevnum, mlir::ValueRange newValues,
@@ -2505,6 +2554,9 @@ void acc::ParallelOp::addWaitOperands(
       std::max(effectiveDeviceTypes.size(), static_cast<size_t>(1)),
       mlir::BoolAttr::get(context, hasDevnum));
   setHasWaitDevnumAttr(mlir::ArrayAttr::get(context, hasDevnums));
+  bool waitForAllQueues = newValues.size() == (hasDevnum ? 1 : 0);
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, waitForAllQueues));
 }
 
 void acc::ParallelOp::addPrivatization(MLIRContext *context,
@@ -2663,30 +2715,45 @@ static ParseResult parseWaitClause(
     llvm::SmallVectorImpl<mlir::OpAsmParser::UnresolvedOperand> &operands,
     llvm::SmallVectorImpl<Type> &types, mlir::ArrayAttr &deviceTypes,
     mlir::DenseI32ArrayAttr &segments, mlir::ArrayAttr &hasDevNum,
-    mlir::ArrayAttr &keywordOnly) {
-  llvm::SmallVector<mlir::Attribute> deviceTypeAttrs, keywordAttrs, devnum;
+    mlir::ArrayAttr &waitAllQueues) {
+  llvm::SmallVector<mlir::Attribute> deviceTypeAttrs, devnum, allQueues;
   llvm::SmallVector<int32_t> seg;
 
   bool needCommaBeforeOperands = false;
 
-  // Keyword only
   if (failed(parser.parseOptionalLParen())) {
-    keywordAttrs.push_back(mlir::acc::DeviceTypeAttr::get(
+    deviceTypeAttrs.push_back(mlir::acc::DeviceTypeAttr::get(
         parser.getContext(), mlir::acc::DeviceType::None));
-    keywordOnly = ArrayAttr::get(parser.getContext(), keywordAttrs);
+    devnum.push_back(BoolAttr::get(parser.getContext(), false));
+    allQueues.push_back(BoolAttr::get(parser.getContext(), true));
+    seg.push_back(0);
+    deviceTypes = ArrayAttr::get(parser.getContext(), deviceTypeAttrs);
+    hasDevNum = ArrayAttr::get(parser.getContext(), devnum);
+    waitAllQueues = ArrayAttr::get(parser.getContext(), allQueues);
+    segments = DenseI32ArrayAttr::get(parser.getContext(), seg);
     return success();
   }
 
   // Parse keyword only attributes
   if (succeeded(parser.parseOptionalLSquare())) {
     if (failed(parser.parseCommaSeparatedList([&]() {
-          if (parser.parseAttribute(keywordAttrs.emplace_back()))
+          if (parser.parseAttribute(deviceTypeAttrs.emplace_back()))
             return failure();
+          devnum.push_back(BoolAttr::get(parser.getContext(), false));
+          allQueues.push_back(BoolAttr::get(parser.getContext(), true));
+          seg.push_back(0);
           return success();
         })))
       return failure();
     if (parser.parseRSquare())
       return failure();
+    if (succeeded(parser.parseOptionalRParen())) {
+      deviceTypes = ArrayAttr::get(parser.getContext(), deviceTypeAttrs);
+      hasDevNum = ArrayAttr::get(parser.getContext(), devnum);
+      waitAllQueues = ArrayAttr::get(parser.getContext(), allQueues);
+      segments = DenseI32ArrayAttr::get(parser.getContext(), seg);
+      return success();
+    }
     needCommaBeforeOperands = true;
   }
 
@@ -2699,7 +2766,8 @@ static ParseResult parseWaitClause(
 
     int32_t crtOperandsSize = operands.size();
 
-    if (succeeded(parser.parseOptionalKeyword("devnum"))) {
+    bool hasDevnum = succeeded(parser.parseOptionalKeyword("devnum"));
+    if (hasDevnum) {
       if (failed(parser.parseColon()))
         return failure();
       devnum.push_back(BoolAttr::get(parser.getContext(), true));
@@ -2707,19 +2775,26 @@ static ParseResult parseWaitClause(
       devnum.push_back(BoolAttr::get(parser.getContext(), false));
     }
 
-    if (failed(parser.parseCommaSeparatedList(
-            mlir::AsmParser::Delimiter::None, [&]() {
-              if (parser.parseOperand(operands.emplace_back()) ||
-                  parser.parseColonType(types.emplace_back()))
-                return failure();
-              return success();
-            })))
-      return failure();
+    if (failed(parser.parseOptionalRBrace())) {
+      if (failed(parser.parseCommaSeparatedList(
+              mlir::AsmParser::Delimiter::None, [&]() {
+                if (parser.parseOperand(operands.emplace_back()) ||
+                    parser.parseColonType(types.emplace_back()))
+                  return failure();
+                return success();
+              })))
+        return failure();
 
-    seg.push_back(operands.size() - crtOperandsSize);
-
-    if (failed(parser.parseRBrace()))
+      if (failed(parser.parseRBrace()))
+        return failure();
+    } else if (hasDevnum) {
       return failure();
+    }
+
+    int32_t segmentSize = operands.size() - crtOperandsSize;
+    seg.push_back(segmentSize);
+    allQueues.push_back(
+        BoolAttr::get(parser.getContext(), segmentSize == (hasDevnum ? 1 : 0)));
 
     if (succeeded(parser.parseOptionalLSquare())) {
       if (parser.parseAttribute(deviceTypeAttrs.emplace_back()) ||
@@ -2735,7 +2810,7 @@ static ParseResult parseWaitClause(
     return failure();
 
   deviceTypes = ArrayAttr::get(parser.getContext(), deviceTypeAttrs);
-  keywordOnly = ArrayAttr::get(parser.getContext(), keywordAttrs);
+  waitAllQueues = ArrayAttr::get(parser.getContext(), allQueues);
   segments = DenseI32ArrayAttr::get(parser.getContext(), seg);
   hasDevNum = ArrayAttr::get(parser.getContext(), devnum);
 
@@ -2753,21 +2828,31 @@ static bool hasOnlyDeviceTypeNone(std::optional<mlir::ArrayAttr> attrs) {
   return false;
 }
 
+static bool
+hasSingleDefaultWaitAllQueues(mlir::OperandRange operands,
+                              std::optional<mlir::ArrayAttr> deviceTypes,
+                              std::optional<mlir::DenseI32ArrayAttr> segments,
+                              std::optional<mlir::ArrayAttr> waitAllQueues) {
+  if (!operands.empty() || !hasOnlyDeviceTypeNone(deviceTypes) || !segments ||
+      segments->size() != 1 || (*segments)[0] != 0 || !waitAllQueues ||
+      waitAllQueues->size() != 1)
+    return false;
+  auto boolAttr = mlir::dyn_cast<mlir::BoolAttr>((*waitAllQueues)[0]);
+  return boolAttr && boolAttr.getValue();
+}
+
 static void printWaitClause(mlir::OpAsmPrinter &p, mlir::Operation *op,
                             mlir::OperandRange operands, mlir::TypeRange types,
                             std::optional<mlir::ArrayAttr> deviceTypes,
                             std::optional<mlir::DenseI32ArrayAttr> segments,
                             std::optional<mlir::ArrayAttr> hasDevNum,
-                            std::optional<mlir::ArrayAttr> keywordOnly) {
+                            std::optional<mlir::ArrayAttr> waitAllQueues) {
 
-  if (operands.begin() == operands.end() && hasOnlyDeviceTypeNone(keywordOnly))
+  if (hasSingleDefaultWaitAllQueues(operands, deviceTypes, segments,
+                                    waitAllQueues))
     return;
 
   p << "(";
-
-  printDeviceTypes(p, keywordOnly);
-  if (hasDeviceTypeValues(keywordOnly) && hasDeviceTypeValues(deviceTypes))
-    p << ", ";
 
   if (hasDeviceTypeValues(deviceTypes)) {
     unsigned opIdx = 0;
@@ -2953,51 +3038,6 @@ static void printOperandWithKeywordOnly(mlir::OpAsmPrinter &p,
   p << ")";
 }
 
-static ParseResult parseOperandsWithKeywordOnly(
-    mlir::OpAsmParser &parser,
-    llvm::SmallVectorImpl<mlir::OpAsmParser::UnresolvedOperand> &operands,
-    llvm::SmallVectorImpl<Type> &types, mlir::UnitAttr &attr) {
-  // Keyword only
-  if (failed(parser.parseOptionalLParen())) {
-    attr = mlir::UnitAttr::get(parser.getContext());
-    return success();
-  }
-
-  if (failed(parser.parseCommaSeparatedList([&]() {
-        if (parser.parseOperand(operands.emplace_back()))
-          return failure();
-        return success();
-      })))
-    return failure();
-  if (failed(parser.parseColon()))
-    return failure();
-  if (failed(parser.parseCommaSeparatedList([&]() {
-        if (parser.parseType(types.emplace_back()))
-          return failure();
-        return success();
-      })))
-    return failure();
-  if (failed(parser.parseRParen()))
-    return failure();
-
-  return success();
-}
-
-static void printOperandsWithKeywordOnly(mlir::OpAsmPrinter &p,
-                                         mlir::Operation *op,
-                                         mlir::OperandRange operands,
-                                         mlir::TypeRange types,
-                                         mlir::UnitAttr attr) {
-  if (attr)
-    return;
-
-  p << "(";
-  llvm::interleaveComma(operands, p, [&](auto it) { p << it; });
-  p << " : ";
-  llvm::interleaveComma(types, p, [&](auto it) { p << it; });
-  p << ")";
-}
-
 static ParseResult
 parseCombinedConstructsLoop(mlir::OpAsmParser &parser,
                             mlir::acc::CombinedConstructsTypeAttr &attr) {
@@ -3074,7 +3114,8 @@ bool acc::SerialOp::hasWaitOnly() {
 }
 
 bool acc::SerialOp::hasWaitOnly(mlir::acc::DeviceType deviceType) {
-  return hasDeviceType(getWaitOnly(), deviceType);
+  return hasWaitAllQueues(getWaitOperandsDeviceType(), getWaitAllQueues(),
+                          deviceType);
 }
 
 mlir::Operation::operand_range SerialOp::getWaitValues() {
@@ -3116,6 +3157,8 @@ LogicalResult acc::SerialOp::verify() {
           *this, getWaitOperands(), getWaitOperandsSegmentsAttr(),
           getWaitOperandsDeviceTypeAttr(), "wait")))
     return failure();
+  if (failed(verifyWaitSegmentAttrCountMatch(*this)))
+    return failure();
 
   if (failed(verifyDeviceTypeCountMatch(*this, getAsyncOperands(),
                                         getAsyncOperandsDeviceTypeAttr(),
@@ -3144,8 +3187,17 @@ void acc::SerialOp::addAsyncOperand(
 
 void acc::SerialOp::addWaitOnly(
     MLIRContext *context, llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
-  setWaitOnlyAttr(addDeviceTypeAffectedOperandHelper(context, getWaitOnlyAttr(),
-                                                     effectiveDeviceTypes));
+  llvm::SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
+  setWaitOperandsDeviceTypeAttr(addDeviceTypeAffectedOperandHelper(
+      context, getWaitOperandsDeviceTypeAttr(), effectiveDeviceTypes,
+      /*arguments=*/{}, getWaitOperandsMutable(), segments));
+  setWaitOperandsSegments(segments);
+  setHasWaitDevnumAttr(addDeviceTypeSegmentFlagHelper(
+      context, getHasWaitDevnumAttr(), effectiveDeviceTypes, false));
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, true));
 }
 void acc::SerialOp::addWaitOperands(
     MLIRContext *context, bool hasDevnum, mlir::ValueRange newValues,
@@ -3168,6 +3220,9 @@ void acc::SerialOp::addWaitOperands(
       std::max(effectiveDeviceTypes.size(), static_cast<size_t>(1)),
       mlir::BoolAttr::get(context, hasDevnum));
   setHasWaitDevnumAttr(mlir::ArrayAttr::get(context, hasDevnums));
+  bool waitForAllQueues = newValues.size() == (hasDevnum ? 1 : 0);
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, waitForAllQueues));
 }
 
 void acc::SerialOp::addPrivatization(MLIRContext *context,
@@ -3273,7 +3328,8 @@ bool acc::KernelsOp::hasWaitOnly() {
 }
 
 bool acc::KernelsOp::hasWaitOnly(mlir::acc::DeviceType deviceType) {
-  return hasDeviceType(getWaitOnly(), deviceType);
+  return hasWaitAllQueues(getWaitOperandsDeviceType(), getWaitAllQueues(),
+                          deviceType);
 }
 
 mlir::Operation::operand_range KernelsOp::getWaitValues() {
@@ -3306,6 +3362,8 @@ LogicalResult acc::KernelsOp::verify() {
   if (failed(verifyDeviceTypeAndSegmentCountMatch(
           *this, getWaitOperands(), getWaitOperandsSegmentsAttr(),
           getWaitOperandsDeviceTypeAttr(), "wait")))
+    return failure();
+  if (failed(verifyWaitSegmentAttrCountMatch(*this)))
     return failure();
 
   if (failed(verifyDeviceTypeCountMatch(*this, getNumWorkers(),
@@ -3395,8 +3453,17 @@ void acc::KernelsOp::addNumGangsOperands(
 
 void acc::KernelsOp::addWaitOnly(
     MLIRContext *context, llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
-  setWaitOnlyAttr(addDeviceTypeAffectedOperandHelper(context, getWaitOnlyAttr(),
-                                                     effectiveDeviceTypes));
+  llvm::SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
+  setWaitOperandsDeviceTypeAttr(addDeviceTypeAffectedOperandHelper(
+      context, getWaitOperandsDeviceTypeAttr(), effectiveDeviceTypes,
+      /*arguments=*/{}, getWaitOperandsMutable(), segments));
+  setWaitOperandsSegments(segments);
+  setHasWaitDevnumAttr(addDeviceTypeSegmentFlagHelper(
+      context, getHasWaitDevnumAttr(), effectiveDeviceTypes, false));
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, true));
 }
 void acc::KernelsOp::addWaitOperands(
     MLIRContext *context, bool hasDevnum, mlir::ValueRange newValues,
@@ -3419,6 +3486,9 @@ void acc::KernelsOp::addWaitOperands(
       std::max(effectiveDeviceTypes.size(), static_cast<size_t>(1)),
       mlir::BoolAttr::get(context, hasDevnum));
   setHasWaitDevnumAttr(mlir::ArrayAttr::get(context, hasDevnums));
+  bool waitForAllQueues = newValues.size() == (hasDevnum ? 1 : 0);
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, waitForAllQueues));
 }
 
 //===----------------------------------------------------------------------===//
@@ -4306,6 +4376,13 @@ LogicalResult acc::DataOp::verify() {
       return emitError("expect data entry/exit operation or acc.getdeviceptr "
                        "as defining op");
 
+  if (failed(verifyDeviceTypeAndSegmentCountMatch(
+          *this, getWaitOperands(), getWaitOperandsSegmentsAttr(),
+          getWaitOperandsDeviceTypeAttr(), "wait")))
+    return failure();
+  if (failed(verifyWaitSegmentAttrCountMatch(*this)))
+    return failure();
+
   if (failed(checkWaitAndAsyncConflict<acc::DataOp>(*this)))
     return failure();
 
@@ -4341,7 +4418,8 @@ mlir::Value DataOp::getAsyncValue(mlir::acc::DeviceType deviceType) {
 bool DataOp::hasWaitOnly() { return hasWaitOnly(mlir::acc::DeviceType::None); }
 
 bool DataOp::hasWaitOnly(mlir::acc::DeviceType deviceType) {
-  return hasDeviceType(getWaitOnly(), deviceType);
+  return hasWaitAllQueues(getWaitOperandsDeviceType(), getWaitAllQueues(),
+                          deviceType);
 }
 
 mlir::Operation::operand_range DataOp::getWaitValues() {
@@ -4381,8 +4459,17 @@ void acc::DataOp::addAsyncOperand(
 
 void acc::DataOp::addWaitOnly(MLIRContext *context,
                               llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
-  setWaitOnlyAttr(addDeviceTypeAffectedOperandHelper(context, getWaitOnlyAttr(),
-                                                     effectiveDeviceTypes));
+  llvm::SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
+  setWaitOperandsDeviceTypeAttr(addDeviceTypeAffectedOperandHelper(
+      context, getWaitOperandsDeviceTypeAttr(), effectiveDeviceTypes,
+      /*arguments=*/{}, getWaitOperandsMutable(), segments));
+  setWaitOperandsSegments(segments);
+  setHasWaitDevnumAttr(addDeviceTypeSegmentFlagHelper(
+      context, getHasWaitDevnumAttr(), effectiveDeviceTypes, false));
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, true));
 }
 
 void acc::DataOp::addWaitOperands(
@@ -4406,6 +4493,9 @@ void acc::DataOp::addWaitOperands(
       std::max(effectiveDeviceTypes.size(), static_cast<size_t>(1)),
       mlir::BoolAttr::get(context, hasDevnum));
   setHasWaitDevnumAttr(mlir::ArrayAttr::get(context, hasDevnums));
+  bool waitForAllQueues = newValues.size() == (hasDevnum ? 1 : 0);
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, waitForAllQueues));
 }
 
 //===----------------------------------------------------------------------===//
@@ -4425,13 +4515,12 @@ LogicalResult acc::ExitDataOp::verify() {
   if (getAsyncOperand() && getAsync())
     return emitError("async attribute cannot appear with asyncOperand");
 
-  // The wait attribute represent the wait clause without values. Therefore the
-  // attribute and operands cannot appear at the same time.
-  if (!getWaitOperands().empty() && getWait())
-    return emitError("wait attribute cannot appear with waitOperands");
-
-  if (getWaitDevnum() && getWaitOperands().empty())
-    return emitError("wait_devnum cannot appear without waitOperands");
+  if (failed(verifyDeviceTypeAndSegmentCountMatch(
+          *this, getWaitOperands(), getWaitOperandsSegmentsAttr(),
+          getWaitOperandsDeviceTypeAttr(), "wait")))
+    return failure();
+  if (failed(verifyWaitSegmentAttrCountMatch(*this)))
+    return failure();
 
   return success();
 }
@@ -4443,7 +4532,6 @@ unsigned ExitDataOp::getNumDataOperands() {
 Value ExitDataOp::getDataOperand(unsigned i) {
   unsigned numOptional = getIfCond() ? 1 : 0;
   numOptional += getAsyncOperand() ? 1 : 0;
-  numOptional += getWaitDevnum() ? 1 : 0;
   return getOperand(getWaitOperands().size() + numOptional + i);
 }
 
@@ -4475,13 +4563,17 @@ void ExitDataOp::addWaitOnly(MLIRContext *context,
                              llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
   assert(effectiveDeviceTypes.empty());
 
-  if (getWaitAttr())
-    return;
-
-  setWaitAttr(mlir::UnitAttr::get(context));
-
-  getWaitDevnumMutable().clear();
-  getWaitOperandsMutable().clear();
+  llvm::SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
+  setWaitOperandsDeviceTypeAttr(addDeviceTypeAffectedOperandHelper(
+      context, getWaitOperandsDeviceTypeAttr(), effectiveDeviceTypes,
+      /*arguments=*/{}, getWaitOperandsMutable(), segments));
+  setWaitOperandsSegments(segments);
+  setHasWaitDevnumAttr(addDeviceTypeSegmentFlagHelper(
+      context, getHasWaitDevnumAttr(), effectiveDeviceTypes, false));
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, true));
 }
 
 void ExitDataOp::addWaitOperands(
@@ -4489,23 +4581,56 @@ void ExitDataOp::addWaitOperands(
     llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
   assert(effectiveDeviceTypes.empty());
 
-  if (getWaitAttr())
-    return;
+  llvm::SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
 
-  // FIXME: At one point we need to figure out how to support multiple devnums
-  // here.  For now, assert.  Eventually we probably want to make dev-num and
-  // operands work in 'lock-step', so that getWaitDevnum().size() ==
-  // getWaitOperandsMutable().size().
-  assert(!getWaitDevnum() && "Merging devnum not yet implemented");
+  setWaitOperandsDeviceTypeAttr(addDeviceTypeAffectedOperandHelper(
+      context, getWaitOperandsDeviceTypeAttr(), effectiveDeviceTypes, newValues,
+      getWaitOperandsMutable(), segments));
+  setWaitOperandsSegments(segments);
 
-  // if hasDevnum, the first value is the devnum. The 'rest' go into the
-  // operands list.
-  if (hasDevnum) {
-    getWaitDevnumMutable().append(newValues.front());
-    newValues = newValues.drop_front();
-  }
+  llvm::SmallVector<mlir::Attribute> hasDevnums;
+  if (getHasWaitDevnumAttr())
+    llvm::copy(getHasWaitDevnumAttr(), std::back_inserter(hasDevnums));
+  hasDevnums.insert(
+      hasDevnums.end(),
+      std::max(effectiveDeviceTypes.size(), static_cast<size_t>(1)),
+      mlir::BoolAttr::get(context, hasDevnum));
+  setHasWaitDevnumAttr(mlir::ArrayAttr::get(context, hasDevnums));
+  bool waitForAllQueues = newValues.size() == (hasDevnum ? 1 : 0);
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, waitForAllQueues));
+}
 
-  getWaitOperandsMutable().append(newValues);
+bool ExitDataOp::hasWaitOnly() {
+  return hasWaitOnly(mlir::acc::DeviceType::None);
+}
+
+bool ExitDataOp::hasWaitOnly(mlir::acc::DeviceType deviceType) {
+  return hasWaitAllQueues(getWaitOperandsDeviceType(), getWaitAllQueues(),
+                          deviceType);
+}
+
+mlir::Operation::operand_range ExitDataOp::getWaitValues() {
+  return getWaitValues(mlir::acc::DeviceType::None);
+}
+
+mlir::Operation::operand_range
+ExitDataOp::getWaitValues(mlir::acc::DeviceType deviceType) {
+  return getWaitValuesWithoutDevnum(
+      getWaitOperandsDeviceType(), getWaitOperands(), getWaitOperandsSegments(),
+      getHasWaitDevnum(), deviceType);
+}
+
+mlir::Value ExitDataOp::getWaitDevnum() {
+  return getWaitDevnum(mlir::acc::DeviceType::None);
+}
+
+mlir::Value ExitDataOp::getWaitDevnum(mlir::acc::DeviceType deviceType) {
+  return getWaitDevnumValue(getWaitOperandsDeviceType(), getWaitOperands(),
+                            getWaitOperandsSegments(), getHasWaitDevnum(),
+                            deviceType);
 }
 
 //===----------------------------------------------------------------------===//
@@ -4525,13 +4650,12 @@ LogicalResult acc::EnterDataOp::verify() {
   if (getAsyncOperand() && getAsync())
     return emitError("async attribute cannot appear with asyncOperand");
 
-  // The wait attribute represent the wait clause without values. Therefore the
-  // attribute and operands cannot appear at the same time.
-  if (!getWaitOperands().empty() && getWait())
-    return emitError("wait attribute cannot appear with waitOperands");
-
-  if (getWaitDevnum() && getWaitOperands().empty())
-    return emitError("wait_devnum cannot appear without waitOperands");
+  if (failed(verifyDeviceTypeAndSegmentCountMatch(
+          *this, getWaitOperands(), getWaitOperandsSegmentsAttr(),
+          getWaitOperandsDeviceTypeAttr(), "wait")))
+    return failure();
+  if (failed(verifyWaitSegmentAttrCountMatch(*this)))
+    return failure();
 
   for (mlir::Value operand : getDataClauseOperands())
     if (!mlir::isa<acc::AttachOp, acc::CreateOp, acc::CopyinOp, acc::MapInfoOp>(
@@ -4548,7 +4672,6 @@ unsigned EnterDataOp::getNumDataOperands() {
 Value EnterDataOp::getDataOperand(unsigned i) {
   unsigned numOptional = getIfCond() ? 1 : 0;
   numOptional += getAsyncOperand() ? 1 : 0;
-  numOptional += getWaitDevnum() ? 1 : 0;
   return getOperand(getWaitOperands().size() + numOptional + i);
 }
 
@@ -4580,13 +4703,17 @@ void EnterDataOp::addWaitOnly(MLIRContext *context,
                               llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
   assert(effectiveDeviceTypes.empty());
 
-  if (getWaitAttr())
-    return;
-
-  setWaitAttr(mlir::UnitAttr::get(context));
-
-  getWaitDevnumMutable().clear();
-  getWaitOperandsMutable().clear();
+  llvm::SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
+  setWaitOperandsDeviceTypeAttr(addDeviceTypeAffectedOperandHelper(
+      context, getWaitOperandsDeviceTypeAttr(), effectiveDeviceTypes,
+      /*arguments=*/{}, getWaitOperandsMutable(), segments));
+  setWaitOperandsSegments(segments);
+  setHasWaitDevnumAttr(addDeviceTypeSegmentFlagHelper(
+      context, getHasWaitDevnumAttr(), effectiveDeviceTypes, false));
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, true));
 }
 
 void EnterDataOp::addWaitOperands(
@@ -4594,23 +4721,56 @@ void EnterDataOp::addWaitOperands(
     llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
   assert(effectiveDeviceTypes.empty());
 
-  if (getWaitAttr())
-    return;
+  llvm::SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
 
-  // FIXME: At one point we need to figure out how to support multiple devnums
-  // here.  For now, assert.  Eventually we probably want to make dev-num and
-  // operands work in 'lock-step', so that getWaitDevnum().size() ==
-  // getWaitOperandsMutable().size().
-  assert(!getWaitDevnum() && "Merging devnum not yet implemented");
+  setWaitOperandsDeviceTypeAttr(addDeviceTypeAffectedOperandHelper(
+      context, getWaitOperandsDeviceTypeAttr(), effectiveDeviceTypes, newValues,
+      getWaitOperandsMutable(), segments));
+  setWaitOperandsSegments(segments);
 
-  // if hasDevnum, the first value is the devnum. The 'rest' go into the
-  // operands list.
-  if (hasDevnum) {
-    getWaitDevnumMutable().append(newValues.front());
-    newValues = newValues.drop_front();
-  }
+  llvm::SmallVector<mlir::Attribute> hasDevnums;
+  if (getHasWaitDevnumAttr())
+    llvm::copy(getHasWaitDevnumAttr(), std::back_inserter(hasDevnums));
+  hasDevnums.insert(
+      hasDevnums.end(),
+      std::max(effectiveDeviceTypes.size(), static_cast<size_t>(1)),
+      mlir::BoolAttr::get(context, hasDevnum));
+  setHasWaitDevnumAttr(mlir::ArrayAttr::get(context, hasDevnums));
+  bool waitForAllQueues = newValues.size() == (hasDevnum ? 1 : 0);
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, waitForAllQueues));
+}
 
-  getWaitOperandsMutable().append(newValues);
+bool EnterDataOp::hasWaitOnly() {
+  return hasWaitOnly(mlir::acc::DeviceType::None);
+}
+
+bool EnterDataOp::hasWaitOnly(mlir::acc::DeviceType deviceType) {
+  return hasWaitAllQueues(getWaitOperandsDeviceType(), getWaitAllQueues(),
+                          deviceType);
+}
+
+mlir::Operation::operand_range EnterDataOp::getWaitValues() {
+  return getWaitValues(mlir::acc::DeviceType::None);
+}
+
+mlir::Operation::operand_range
+EnterDataOp::getWaitValues(mlir::acc::DeviceType deviceType) {
+  return getWaitValuesWithoutDevnum(
+      getWaitOperandsDeviceType(), getWaitOperands(), getWaitOperandsSegments(),
+      getHasWaitDevnum(), deviceType);
+}
+
+mlir::Value EnterDataOp::getWaitDevnum() {
+  return getWaitDevnum(mlir::acc::DeviceType::None);
+}
+
+mlir::Value EnterDataOp::getWaitDevnum(mlir::acc::DeviceType deviceType) {
+  return getWaitDevnumValue(getWaitOperandsDeviceType(), getWaitOperands(),
+                            getWaitOperandsSegments(), getHasWaitDevnum(),
+                            deviceType);
 }
 
 //===----------------------------------------------------------------------===//
@@ -5234,6 +5394,8 @@ LogicalResult acc::UpdateOp::verify() {
           *this, getWaitOperands(), getWaitOperandsSegmentsAttr(),
           getWaitOperandsDeviceTypeAttr(), "wait")))
     return failure();
+  if (failed(verifyWaitSegmentAttrCountMatch(*this)))
+    return failure();
 
   if (failed(checkWaitAndAsyncConflict<acc::UpdateOp>(*this)))
     return failure();
@@ -5289,7 +5451,8 @@ bool UpdateOp::hasWaitOnly() {
 }
 
 bool UpdateOp::hasWaitOnly(mlir::acc::DeviceType deviceType) {
-  return hasDeviceType(getWaitOnly(), deviceType);
+  return hasWaitAllQueues(getWaitOperandsDeviceType(), getWaitAllQueues(),
+                          deviceType);
 }
 
 mlir::Operation::operand_range UpdateOp::getWaitValues() {
@@ -5329,8 +5492,17 @@ void UpdateOp::addAsyncOperand(
 
 void UpdateOp::addWaitOnly(MLIRContext *context,
                            llvm::ArrayRef<DeviceType> effectiveDeviceTypes) {
-  setWaitOnlyAttr(addDeviceTypeAffectedOperandHelper(context, getWaitOnlyAttr(),
-                                                     effectiveDeviceTypes));
+  llvm::SmallVector<int32_t> segments;
+  if (getWaitOperandsSegments())
+    llvm::copy(*getWaitOperandsSegments(), std::back_inserter(segments));
+  setWaitOperandsDeviceTypeAttr(addDeviceTypeAffectedOperandHelper(
+      context, getWaitOperandsDeviceTypeAttr(), effectiveDeviceTypes,
+      /*arguments=*/{}, getWaitOperandsMutable(), segments));
+  setWaitOperandsSegments(segments);
+  setHasWaitDevnumAttr(addDeviceTypeSegmentFlagHelper(
+      context, getHasWaitDevnumAttr(), effectiveDeviceTypes, false));
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, true));
 }
 
 void UpdateOp::addWaitOperands(
@@ -5354,6 +5526,9 @@ void UpdateOp::addWaitOperands(
       std::max(effectiveDeviceTypes.size(), static_cast<size_t>(1)),
       mlir::BoolAttr::get(context, hasDevnum));
   setHasWaitDevnumAttr(mlir::ArrayAttr::get(context, hasDevnums));
+  bool waitForAllQueues = newValues.size() == (hasDevnum ? 1 : 0);
+  setWaitAllQueuesAttr(addDeviceTypeSegmentFlagHelper(
+      context, getWaitAllQueuesAttr(), effectiveDeviceTypes, waitForAllQueues));
 }
 
 //===----------------------------------------------------------------------===//

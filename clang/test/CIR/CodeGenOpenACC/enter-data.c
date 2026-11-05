@@ -100,7 +100,7 @@ void acc_data(int parmVar, int *ptrParmVar) {
   // CHECK-NEXT: %[[ONE_CONST:.*]] = cir.const #cir.int<1> : !s32i
   // CHECK-NEXT: %[[ONE_CAST:.*]] = cir.builtin_int_cast %[[ONE_CONST]]
   // CHECK-NEXT: %[[CREATE1:.*]] = acc.create varPtr(%[[PARM]] : !cir.ptr<!s32i>) structured(false) name("parmVar") -> !cir.ptr<!s32i>
-  // CHECK-NEXT: acc.enter_data wait(%[[ONE_CAST]] : si32) dataOperands(%[[CREATE1]] : !cir.ptr<!s32i>)
+  // CHECK-NEXT: acc.enter_data wait({%[[ONE_CAST]] : si32}) dataOperands(%[[CREATE1]] : !cir.ptr<!s32i>)
 
 #pragma acc enter data wait(parmVar, 1, 2) create(parmVar)
   // CHECK-NEXT: %[[PARM_LOAD:.*]] = cir.load{{.*}} %[[PARM]]
@@ -110,7 +110,7 @@ void acc_data(int parmVar, int *ptrParmVar) {
   // CHECK-NEXT: %[[TWO_CONST:.*]] = cir.const #cir.int<2> : !s32i
   // CHECK-NEXT: %[[TWO_CAST:.*]] = cir.builtin_int_cast %[[TWO_CONST]]
   // CHECK-NEXT: %[[CREATE1:.*]] = acc.create varPtr(%[[PARM]] : !cir.ptr<!s32i>) structured(false) name("parmVar") -> !cir.ptr<!s32i>
-  // CHECK-NEXT: acc.enter_data wait(%[[PARM_CAST]], %[[ONE_CAST]], %[[TWO_CAST]] : si32, si32, si32) dataOperands(%[[CREATE1]] : !cir.ptr<!s32i>)
+  // CHECK-NEXT: acc.enter_data wait({%[[PARM_CAST]] : si32, %[[ONE_CAST]] : si32, %[[TWO_CAST]] : si32}) dataOperands(%[[CREATE1]] : !cir.ptr<!s32i>)
 
 #pragma acc enter data wait(devnum: parmVar: 1, 2) create(parmVar)
   // CHECK-NEXT: %[[PARM_LOAD:.*]] = cir.load{{.*}} %[[PARM]]
@@ -120,7 +120,7 @@ void acc_data(int parmVar, int *ptrParmVar) {
   // CHECK-NEXT: %[[TWO_CONST:.*]] = cir.const #cir.int<2> : !s32i
   // CHECK-NEXT: %[[TWO_CAST:.*]] = cir.builtin_int_cast %[[TWO_CONST]]
   // CHECK-NEXT: %[[CREATE1:.*]] = acc.create varPtr(%[[PARM]] : !cir.ptr<!s32i>) structured(false) name("parmVar") -> !cir.ptr<!s32i>
-  // CHECK-NEXT: acc.enter_data wait_devnum(%[[PARM_CAST]] : si32) wait(%[[ONE_CAST]], %[[TWO_CAST]] : si32, si32) dataOperands(%[[CREATE1]] : !cir.ptr<!s32i>)
+  // CHECK-NEXT: acc.enter_data wait({devnum: %[[PARM_CAST]] : si32, %[[ONE_CAST]] : si32, %[[TWO_CAST]] : si32}) dataOperands(%[[CREATE1]] : !cir.ptr<!s32i>)
 
 }
 
@@ -128,19 +128,19 @@ void gh228290(int i) {
   // CHECK: cir.func{{.*}}@gh228290(
 
 #pragma acc enter data copyin(i) wait wait
-// CHECK: acc.enter_data wait dataOperands({{.*}})
+// CHECK: acc.enter_data wait({}, {}) dataOperands({{.*}})
 
 #pragma acc enter data copyin(i) wait wait(1)
-// CHECK: acc.enter_data wait dataOperands({{.*}})
+// CHECK: acc.enter_data wait({}, {%{{.*}} : si32}) dataOperands({{.*}})
 
 #pragma acc enter data copyin(i) wait(1) wait
-// CHECK: acc.enter_data wait dataOperands({{.*}})
+// CHECK: acc.enter_data wait({%{{.*}} : si32}, {}) dataOperands({{.*}})
 
 #pragma acc enter data copyin(i) wait(1) wait(2)
 // CHECK: %[[ONE:.*]] = cir.const #cir.int<1> : !s32i
 // CHECK: %[[ONE_CAST:.*]] = cir.builtin_int_cast %[[ONE]] : !s32i -> si32
 // CHECK: %[[TWO:.*]] = cir.const #cir.int<2> : !s32i
 // CHECK: %[[TWO_CAST:.*]] = cir.builtin_int_cast %[[TWO]] : !s32i -> si32
-// CHECK: acc.enter_data wait(%[[ONE_CAST]], %[[TWO_CAST]] : si32, si32) dataOperands({{.*}})
+// CHECK: acc.enter_data wait({%[[ONE_CAST]] : si32}, {%[[TWO_CAST]] : si32}) dataOperands({{.*}})
 }
 
